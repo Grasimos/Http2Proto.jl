@@ -8,6 +8,10 @@ using UUIDs
 
 using ..Exc, ..H2Settings, ..RateLimiter
 
+# ============================================================================
+# EXPORTS
+# ============================================================================
+
 export AbstractHTTP2Connection, HTTP2Stream, StreamState, HTTP2Connection, ConnectionState, StreamMultiplexer,
        StreamPriority, HTTP2Request, HTTP2Response, ConnectionRole,
        CONNECTION_PREFACE, CONNECTION_STREAM_ID, FRAME_HEADER_SIZE, MAX_FRAME_SIZE_UPPER_BOUND, MAX_STREAM_ID, STREAM_ID_MASK,
@@ -23,59 +27,70 @@ export AbstractHTTP2Connection, HTTP2Stream, StreamState, HTTP2Connection, Conne
        priority_weight, get_stream, has_stream, next_stream_id!,
        is_client, is_server, is_idle, is_open, is_closing, is_closed, is_going_away, is_active
 
+# ============================================================================
+# HTTP/2 PROTOCOL CONSTANTS
+# ============================================================================
 
-# --- Connection & Lifecycle (RFC 7540, Section 3) ---
+"""HTTP/2 connection preface that must be sent by clients (RFC 7540, Section 3.5)"""
 const CONNECTION_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-# Connection Flow Control (Section 5.2) #TODO: Move to Module
+
+"""Stream ID 0 is reserved for connection-level frames"""
 const CONNECTION_STREAM_ID = 0x0
 
-
-# --- Frame Layout & Limits (RFC 7540, Section 4 & 6) ---
+# Frame size constants
+"""Size of HTTP/2 frame header in bytes"""
 const FRAME_HEADER_SIZE = 9
-const MAX_FRAME_SIZE_UPPER_BOUND = 16777215  # 2^24 - 1
 
-# --- Stream Identifiers (RFC 7540, Section 5.1.1) ---
-const MAX_STREAM_ID = 2147483647  # 2^31 - 1
+"""Maximum allowed frame payload size (2^24 - 1 bytes)"""
+const MAX_FRAME_SIZE_UPPER_BOUND = 16777215
+
+"""Maximum valid stream ID (2^31 - 1)"""
+const MAX_STREAM_ID = 2147483647
+
+"""Bitmask for extracting stream ID from frame header"""
 const STREAM_ID_MASK = 0x7FFFFFFF
 
-# --- Flow Control (RFC 7540, Section 5.2 & 6.9) ---
-const MAX_WINDOW_SIZE = 2147483647  # 2^31 - 1
+"""Maximum flow control window size (2^31 - 1)"""
+const MAX_WINDOW_SIZE = 2147483647
 
+# ============================================================================
+# HTTP HEADER CONSTANTS
+# ============================================================================
 
-
-# --- HPACK & Header Semantics (RFC 7540, Section 8 & RFC 7541) ---
+"""Set of HTTP/2 pseudo-headers that must be prefixed with ':'"""
 const PSEUDO_HEADERS = Set([":method", ":scheme", ":authority", ":path", ":status"])
+
+"""HTTP/1.1 headers that are forbidden in HTTP/2"""
 const FORBIDDEN_HEADERS = Set(["connection", "upgrade", "http2-settings", "te", "transfer-encoding", "proxy-connection"])
 
-# --- Priority Scheduling (RFC 7540, Section 5.3) ---
-const DEFAULT_WEIGHT = 16 #TODO: Move to Module
-const MIN_WEIGHT = 1        # Ελάχιστο βάρος
-const MAX_WEIGHT = 256      # Μέγιστο βάρος
+# ============================================================================
+# STREAM PRIORITY CONSTANTS
+# ============================================================================
 
-# ALPN Protocol Identifiers (Section 3.1) #TODO: Move to Module
-const ALPN_HTTP2 = "h2"             # HTTP/2 over TLS
-const ALPN_HTTP2_CLEARTEXT = "h2c"  # HTTP/2 χωρίς TLS
+"""Default stream priority weight"""
+const DEFAULT_WEIGHT = 16
 
+"""Minimum stream priority weight"""
+const MIN_WEIGHT = 1
 
-# Maximum values for various fields
-const MAX_PADDING_LENGTH = 255          # Μέγιστο μήκος padding
-const MAX_PRIORITY_WEIGHT = 255         # Μέγιστο βάρος προτεραιότητας
-const MAX_PROMISED_STREAM_ID = MAX_STREAM_ID  # Μέγιστο promised stream ID
+"""Maximum stream priority weight"""
+const MAX_WEIGHT = 256
 
-# Frame validation constants
-const PING_FRAME_SIZE = 8                   # Σταθερό μέγεθος PING (8 bytes)
-const GOAWAY_FRAME_MIN_SIZE = 8             # Ελάχιστο μέγεθος GOAWAY
-const WINDOW_UPDATE_FRAME_SIZE = 4          # Σταθερό μέγεθος WINDOW_UPDATE
-const PRIORITY_FRAME_SIZE = 5               # Σταθερό μέγεθος PRIORITY
-const RST_STREAM_FRAME_SIZE = 4             # Σταθερό μέγεθος RST_STREAM
+# ============================================================================
+# ALPN AND TLS CONSTANTS
+# ============================================================================
 
-# HTTP Status Codes (Section 8.1.2.3)
-const HTTP_STATUS_BAD_REQUEST = 400                         # Κακό αίτημα
-const HTTP_STATUS_REQUEST_HEADER_FIELDS_TOO_LARGE = 431     # Επικεφαλίδες πολύ μεγάλες
+"""HTTP/2 over TLS Application-Layer Protocol Negotiation identifier"""
+const ALPN_HTTP2 = "h2"
 
-# TLS/Security requirements (Appendix A)#TODO: Move to Module
-const TLS_MIN_VERSION = "TLSv1.2"   # Ελάχιστη έκδοση TLS
-const REQUIRED_TLS_CIPHER_SUITES = [ # Απαιτούμενα cipher suites
+"""HTTP/2 cleartext (without TLS) identifier"""
+const ALPN_HTTP2_CLEARTEXT = "h2c"
+
+"""Minimum required TLS version for HTTP/2"""
+const TLS_MIN_VERSION = "TLSv1.2"
+
+"""Required TLS cipher suites for HTTP/2 connections"""
+const REQUIRED_TLS_CIPHER_SUITES = [
     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
@@ -83,30 +98,101 @@ const REQUIRED_TLS_CIPHER_SUITES = [ # Απαιτούμενα cipher suites
     "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384"
 ]
 
-# Connection timeout defaults (in seconds)#TODO: Move to Module
-const DEFAULT_PING_TIMEOUT = 60        # Timeout για PING response
-const DEFAULT_SETTINGS_TIMEOUT = 10    # Timeout για SETTINGS ACK
-const DEFAULT_CONNECTION_TIMEOUT = 300  # Γενικό timeout σύνδεσης
+# ============================================================================
+# FRAME SIZE CONSTANTS
+# ============================================================================
 
-# HTTP/2 Protocol Requirements (Section 9)#TODO: Move to Module
-const MAX_HEADER_NAME_LENGTH = 1024     # Μέγιστο μήκος ονόματος header
-const MAX_HEADER_VALUE_LENGTH = 8192    # Μέγιστο μήκος τιμής header
-const MAX_URI_LENGTH = 8192             # Μέγιστο μήκος URI
+"""Maximum padding length for padded frames"""
+const MAX_PADDING_LENGTH = 255
 
-# Push Promise Constants (Section 8.2)#TODO: Move to Module
-const PUSH_PROMISE_MIN_FRAME_SIZE = 4   # Ελάχιστο μέγεθος PUSH_PROMISE
+"""Maximum priority weight value in priority frames"""
+const MAX_PRIORITY_WEIGHT = 255
 
-# Connection Management (Section 6.8)#TODO: Move to Module
-const GOAWAY_LAST_STREAM_ID_MASK = 0x7fffffff  # Μάσκα για last stream ID στο GOAWAY
+"""Maximum stream ID that can be promised in PUSH_PROMISE frames"""
+const MAX_PROMISED_STREAM_ID = MAX_STREAM_ID
+
+"""Fixed size of PING frame payload (8 bytes)"""
+const PING_FRAME_SIZE = 8
+
+"""Minimum size of GOAWAY frame payload"""
+const GOAWAY_FRAME_MIN_SIZE = 8
+
+"""Fixed size of WINDOW_UPDATE frame payload"""
+const WINDOW_UPDATE_FRAME_SIZE = 4
+
+"""Fixed size of PRIORITY frame payload"""
+const PRIORITY_FRAME_SIZE = 5
+
+"""Fixed size of RST_STREAM frame payload"""
+const RST_STREAM_FRAME_SIZE = 4
+
+"""Minimum size of PUSH_PROMISE frame payload"""
+const PUSH_PROMISE_MIN_FRAME_SIZE = 4
+
+"""Bitmask for extracting last stream ID from GOAWAY frame"""
+const GOAWAY_LAST_STREAM_ID_MASK = 0x7fffffff
+
+# ============================================================================
+# HTTP STATUS CODES
+# ============================================================================
+
+"""HTTP 400 Bad Request status code"""
+const HTTP_STATUS_BAD_REQUEST = 400
+
+"""HTTP 431 Request Header Fields Too Large status code"""
+const HTTP_STATUS_REQUEST_HEADER_FIELDS_TOO_LARGE = 431
+
+# ============================================================================
+# TIMEOUT CONSTANTS
+# ============================================================================
+
+"""Default timeout for PING frame responses (seconds)"""
+const DEFAULT_PING_TIMEOUT = 60
+
+"""Default timeout for SETTINGS frame acknowledgment (seconds)"""
+const DEFAULT_SETTINGS_TIMEOUT = 10
+
+"""Default general connection timeout (seconds)"""
+const DEFAULT_CONNECTION_TIMEOUT = 300
+
+# ============================================================================
+# SIZE LIMIT CONSTANTS
+# ============================================================================
+
+"""Maximum allowed length of HTTP header names"""
+const MAX_HEADER_NAME_LENGTH = 1024
+
+"""Maximum allowed length of HTTP header values"""
+const MAX_HEADER_VALUE_LENGTH = 8192
+
+"""Maximum allowed length of URIs"""
+const MAX_URI_LENGTH = 8192
+
+# ============================================================================
+# ENUMERATIONS
+# ============================================================================
 
 """
-    ConnectionRole
+Enumeration representing whether this connection is acting as a client or server.
 
-Enum representing whether this connection is acting as a client or server.
+# Values
+- `CLIENT`: Connection is acting as a client
+- `SERVER`: Connection is acting as a server
 """
-@enum ConnectionRole CLIENT=0 SERVER=1 # Enum που ορίζει τον ρόλο της σύνδεσης
+@enum ConnectionRole CLIENT=0 SERVER=1
 
-# --- Stream & Connection States (RFC 7540, Section 5.1) ---
+"""
+Stream states as defined in RFC 7540, Section 5.1.
+
+# Values
+- `STREAM_IDLE`: Stream has not been used yet
+- `STREAM_RESERVED_LOCAL`: Stream is reserved for local use
+- `STREAM_RESERVED_REMOTE`: Stream is reserved for remote use  
+- `STREAM_OPEN`: Stream is open for bidirectional communication
+- `STREAM_HALF_CLOSED_LOCAL`: Local endpoint has sent END_STREAM
+- `STREAM_HALF_CLOSED_REMOTE`: Remote endpoint has sent END_STREAM
+- `STREAM_CLOSED`: Stream is completely closed
+"""
 @enum StreamState begin
     STREAM_IDLE
     STREAM_RESERVED_LOCAL
@@ -117,6 +203,17 @@ Enum representing whether this connection is acting as a client or server.
     STREAM_CLOSED
 end
 
+"""
+Connection states for HTTP/2 connections.
+
+# Values
+- `CONNECTION_IDLE`: Connection is not yet established
+- `CONNECTION_OPEN`: Connection is active and ready for streams
+- `CONNECTION_CLOSING`: Connection is in the process of closing
+- `CONNECTION_CLOSED`: Connection is completely closed
+- `CONNECTION_GOAWAY_SENT`: A GOAWAY frame has been sent
+- `CONNECTION_GOAWAY_RECEIVED`: A GOAWAY frame has been received
+"""
 @enum ConnectionState begin
     CONNECTION_IDLE
     CONNECTION_OPEN
@@ -126,120 +223,194 @@ end
     CONNECTION_GOAWAY_RECEIVED
 end
 
-abstract type AbstractHTTP2Connection end 
+# ============================================================================
+# ABSTRACT TYPES
+# ============================================================================
+
+"""
+Abstract base type for all HTTP/2 connection implementations.
+"""
+abstract type AbstractHTTP2Connection end
+
+# ============================================================================
+# REQUEST AND RESPONSE TYPES
+# ============================================================================
 
 """
     HTTP2Request
 
-Represents an HTTP/2 request with headers and body.
+Represents an HTTP/2 request with method, URI, headers, and body.
+
+# Fields
+- `method::String`: HTTP method (GET, POST, etc.)
+- `uri::String`: Request URI
+- `headers::Vector{Pair{String, String}}`: HTTP headers as name-value pairs
+- `body::Vector{UInt8}`: Request body as bytes
+- `stream_id::Int32`: Associated stream ID
+
+# Constructor
+    HTTP2Request(method, uri, headers=[], body=UInt8[], stream_id=0)
+
+Creates a new HTTP/2 request with validation of stream ID bounds.
 """
-struct HTTP2Request # Struct για αίτημα HTTP/2
-    method::String # Μέθοδος HTTP (GET, POST, κλπ)
-    uri::String # URI προορισμού
-    headers::Vector{Pair{String, String}} # Διάνυσμα headers
-    body::Vector{UInt8} # Σώμα αιτήματος σε bytes
-    stream_id::Int32 # Αναγνωριστικό stream
-    
-    function HTTP2Request(method::String, uri::String, # Constructor με πλήρεις παραμέτρους
-                         headers::Vector{Pair{String, String}} = Pair{String, String}[], # Προεπιλεγμένα κενά headers
-                         body::Union{String, Vector{UInt8}} = UInt8[], # Προεπιλεγμένο κενό σώμα
-                         stream_id::Integer = 0) # Προεπιλεγμένο stream ID
-        body_bytes = body isa String ? Vector{UInt8}(body) : body # Μετατροπή σε bytes αν χρειάζεται
-        if stream_id < 0 || stream_id > MAX_STREAM_ID # Έλεγχος έγκυρου stream ID
-            throw(StreamError("Stream ID $stream_id out of valid range [0, $MAX_STREAM_ID]")) # Σφάλμα stream ID
+struct HTTP2Request
+    method::String
+    uri::String
+    headers::Vector{Pair{String, String}}
+    body::Vector{UInt8}
+    stream_id::Int32
+
+    function HTTP2Request(method::String, uri::String,
+                         headers::Vector{Pair{String, String}} = Pair{String, String}[],
+                         body::Union{String, Vector{UInt8}} = UInt8[],
+                         stream_id::Integer = 0)
+        body_bytes = body isa String ? Vector{UInt8}(body) : body
+        if stream_id < 0 || stream_id > MAX_STREAM_ID
+            throw(StreamError("Stream ID $stream_id out of valid range [0, $MAX_STREAM_ID]"))
         end
-        new(method, uri, headers, body_bytes, Int32(stream_id)) # Δημιουργεί νέο αίτημα
+        new(method, uri, headers, body_bytes, Int32(stream_id))
     end
 end
 
 """
     HTTP2Response
 
-Represents an HTTP/2 response with status, headers and body.
+Represents an HTTP/2 response with status code, headers, and body.
+
+# Fields
+- `status::Int`: HTTP status code (200, 404, etc.)
+- `headers::Vector{Pair{String, String}}`: HTTP headers as name-value pairs
+- `body::Vector{UInt8}`: Response body as bytes
+- `stream_id::Int32`: Associated stream ID
+
+# Constructor
+    HTTP2Response(status, headers=[], body=UInt8[], stream_id=0)
+
+Creates a new HTTP/2 response with validation of status code and stream ID.
 """
-struct HTTP2Response # Struct για απάντηση HTTP/2
-    status::Int # Κωδικός κατάστασης HTTP
-    headers::Vector{Pair{String, String}} # Διάνυσμα headers απάντησης
-    body::Vector{UInt8} # Σώμα απάντησης σε bytes
-    stream_id::Int32 # Αναγνωριστικό stream
-    
-    function HTTP2Response(status::Integer, # Constructor με κωδικό κατάστασης
-                          headers::Vector{Pair{String, String}} = Pair{String, String}[], # Προεπιλεγμένα κενά headers
-                          body::Union{String, Vector{UInt8}} = UInt8[], # Προεπιλεγμένο κενό σώμα
-                          stream_id::Integer = 0) # Προεπιλεγμένο stream ID
-        body_bytes = body isa String ? Vector{UInt8}(body) : body # Μετατροπή σε bytes αν χρειάζεται
-        if status < 100 || status > 599 # Έλεγχος έγκυρου κωδικού κατάστασης
-            throw(ProtocolError("Invalid HTTP status code: $status")) # Σφάλμα κωδικού κατάστασης
+struct HTTP2Response
+    status::Int
+    headers::Vector{Pair{String, String}}
+    body::Vector{UInt8}
+    stream_id::Int32
+
+    function HTTP2Response(status::Integer,
+                          headers::Vector{Pair{String, String}} = Pair{String, String}[],
+                          body::Union{String, Vector{UInt8}} = UInt8[],
+                          stream_id::Integer = 0)
+        body_bytes = body isa String ? Vector{UInt8}(body) : body
+        if status < 100 || status > 599
+            throw(ProtocolError("Invalid HTTP status code: $status"))
         end
-        if stream_id < 0 || stream_id > MAX_STREAM_ID # Έλεγχος έγκυρου stream ID
-            throw(StreamError("Stream ID $stream_id out of valid range [0, $MAX_STREAM_ID]")) # Σφάλμα stream ID
+        if stream_id < 0 || stream_id > MAX_STREAM_ID
+            throw(StreamError("Stream ID $stream_id out of valid range [0, $MAX_STREAM_ID]"))
         end
-        new(Int(status), headers, body_bytes, Int32(stream_id)) # Δημιουργεί νέα απάντηση
+        new(Int(status), headers, body_bytes, Int32(stream_id))
     end
 end
 
-
-# ============================================================================= # Διαχωριστική γραμμή
-# Stream Priority # Προτεραιότητα Stream
-# ============================================================================= # Διαχωριστική γραμμή
+# ============================================================================
+# STREAM PRIORITY MANAGEMENT
+# ============================================================================
 
 """
     StreamPriority
 
-Stream priority information including dependency and weight.
-"""
-struct StreamPriority # Struct για πληροφορίες προτεραιότητας stream
-    exclusive::Bool # Αποκλειστική προτεραιότητα
-    stream_dependency::Int32 # Εξάρτηση από άλλο stream
-    weight::UInt8 # Βάρος προτεραιότητας
+Represents stream priority information including dependency and weight.
 
-    function StreamPriority(exclusive::Bool, stream_dependency::Integer, weight::Integer) # Constructor με validation
-        if weight < MIN_WEIGHT || weight > MAX_WEIGHT # Έλεγχος έγκυρου βάρους
-            throw(PriorityError("Priority weight $weight not in valid range [$MIN_WEIGHT, $MAX_WEIGHT]", weight)) # Σφάλμα βάρους προτεραιότητας
+# Fields
+- `exclusive::Bool`: Whether this stream exclusively depends on parent
+- `stream_dependency::Int32`: Stream ID this stream depends on
+- `weight::UInt8`: Priority weight (internally stored as weight-1)
+
+# Constructor
+    StreamPriority(exclusive, stream_dependency, weight)
+
+Creates stream priority with validation of weight and dependency bounds.
+
+    StreamPriority()
+
+Creates default priority (non-exclusive, no dependency, default weight).
+"""
+struct StreamPriority
+    exclusive::Bool
+    stream_dependency::Int32
+    weight::UInt8
+
+    function StreamPriority(exclusive::Bool, stream_dependency::Integer, weight::Integer)
+        if weight < MIN_WEIGHT || weight > MAX_WEIGHT
+            throw(PriorityError("Priority weight $weight not in valid range [$MIN_WEIGHT, $MAX_WEIGHT]", weight))
         end
-        if stream_dependency < 0 || stream_dependency > MAX_STREAM_ID # Έλεγχος έγκυρης εξάρτησης
-            throw(PriorityError("Stream dependency $stream_dependency out of valid range [0, $MAX_STREAM_ID]", stream_dependency)) # Σφάλμα εξάρτησης stream
+        if stream_dependency < 0 || stream_dependency > MAX_STREAM_ID
+            throw(PriorityError("Stream dependency $stream_dependency out of valid range [0, $MAX_STREAM_ID]", stream_dependency))
         end
-        new(exclusive, Int32(stream_dependency), UInt8(weight - 1)) # Δημιουργεί νέο instance (βάρος - 1)
+        new(exclusive, Int32(stream_dependency), UInt8(weight - 1))
     end
 end
 
-# Default priority # Προεπιλεγμένη προτεραιότητα
-StreamPriority() = StreamPriority(false, 0, DEFAULT_WEIGHT) # Constructor χωρίς παραμέτρους
-
-# Get actual weight (1-256) # Παίρνει το πραγματικό βάρος
-priority_weight(p::StreamPriority) = Int(p.weight) + 1 # Επιστρέφει βάρος + 1
+"""Default priority constructor - non-exclusive, no dependency, default weight"""
+StreamPriority() = StreamPriority(false, 0, DEFAULT_WEIGHT)
 
 """
-    HTTP2Stream
+    priority_weight(p::StreamPriority) -> Int
 
-Represents an HTTP/2 stream with state management and flow control.
+Get the actual priority weight (1-256) from a StreamPriority object.
 """
-mutable struct HTTP2Stream <: IO# Mutable struct για HTTP/2 stream
-    const id::UInt32 # Σταθερό αναγνωριστικό stream
-    const connection::AbstractHTTP2Connection # Αναφορά πίσω στη σύνδεση # Σταθερή αναφορά στη σύνδεση
-    state::StreamState # Κατάσταση του stream
-    receive_window::Int32 # Παράθυρο λήψης για flow control
-    send_window::Int32 # Παράθυρο αποστολής για flow control
-    parent::Union{HTTP2Stream, Nothing} # Γονικό stream για εξαρτήσεις
-    children::Vector{HTTP2Stream} # Παιδικά streams
-    priority::StreamPriority # Πληροφορίες προτεραιότητας
-    headers::Vector{Pair{String, String}} # Headers του stream
-    const data_buffer::IOBuffer # Σταθερό buffer για δεδομένα
-    end_stream_received::Bool # Flag για λήψη τέλους stream
-    end_stream_sent::Bool # Flag για αποστολή τέλους stream
-    const created_at::DateTime # Σταθερή ημερομηνία δημιουργίας
-    last_activity::DateTime # Τελευταία δραστηριότητα
-    const buffer_lock::ReentrantLock # Σταθερό lock για thread safety
+priority_weight(p::StreamPriority) = Int(p.weight) + 1
+
+# ============================================================================
+# STREAM MANAGEMENT
+# ============================================================================
+
+"""
+Special message type used to instruct the send_loop to clean up a stream.
+"""
+struct CleanupStream end
+
+"""
+    HTTP2Stream <: IO
+
+Represents an HTTP/2 stream with state management, flow control, and data buffering.
+Implements the IO interface for reading stream data.
+
+# Fields
+- `id::UInt32`: Unique stream identifier
+- `connection::AbstractHTTP2Connection`: Parent connection
+- `state::StreamState`: Current stream state
+- `receive_window::Int32`: Flow control receive window
+- `send_window::Int32`: Flow control send window
+- `parent::Union{HTTP2Stream, Nothing}`: Parent stream for dependencies
+- `children::Vector{HTTP2Stream}`: Child streams depending on this stream
+- `priority::StreamPriority`: Stream priority information
+- `headers::Vector{Pair{String, String}}`: Received headers
+- `data_buffer::IOBuffer`: Buffer for incoming data
+- `end_stream_received::Bool`: Whether END_STREAM flag was received
+- `end_stream_sent::Bool`: Whether END_STREAM flag was sent
+- `created_at::DateTime`: Stream creation timestamp
+- `last_activity::DateTime`: Last activity timestamp
+- `buffer_lock::ReentrantLock`: Lock for thread-safe buffer access
+- `data_available::Base.GenericCondition`: Condition for data availability
+- `headers_available::Base.GenericCondition`: Condition for header availability
+"""
+mutable struct HTTP2Stream <: IO
+    const id::UInt32
+    const connection::AbstractHTTP2Connection
+    state::StreamState
+    receive_window::Int32
+    send_window::Int32
+    parent::Union{HTTP2Stream, Nothing}
+    children::Vector{HTTP2Stream}
+    priority::StreamPriority
+    headers::Vector{Pair{String, String}}
+    const data_buffer::IOBuffer
+    end_stream_received::Bool
+    end_stream_sent::Bool
+    const created_at::DateTime
+    last_activity::DateTime
+    const buffer_lock::ReentrantLock
     const data_available::Base.GenericCondition{ReentrantLock}
     const headers_available::Base.GenericCondition{ReentrantLock}
 end
-
-# ============================================================================= 
-# Stream Multiplexer 
-# ============================================================================= 
-"""Ειδικός τύπος-μήνυμα για να δώσει εντολή στον send_loop να καθαρίσει ένα stream."""
-struct CleanupStream end
 
 """
     StreamMultiplexer
@@ -247,151 +418,207 @@ struct CleanupStream end
 Manages the set of active HTTP/2 streams for a connection, enforcing stream limits,
 priorities, and correct stream opening/closing according to RFC 7540. Supports
 concurrent frame transmission with stream prioritization.
+
+# Fields
+- `conn::AbstractHTTP2Connection`: Parent connection
+- `frame_channels::Dict{UInt32, Channel}`: Per-stream frame channels
+- `pending_streams::PriorityQueue{UInt32, Int}`: Queue of pending streams by priority
+- `role::ConnectionRole`: Connection role (client or server)
+- `next_stream_id::UInt32`: Next stream ID to assign
+- `max_concurrent_streams::UInt32`: Maximum allowed concurrent streams
+- `send_condition::Base.GenericCondition`: Condition for send synchronization
+- `send_lock::ReentrantLock`: Lock for send operations
+- `send_task::Union{Task, Nothing}`: Background send task
 """
 mutable struct StreamMultiplexer
     conn::AbstractHTTP2Connection
-    frame_channels::Dict{UInt32, Channel{Union{HTTP2Frame, CleanupStream}}} # <--- ΑΛΛΑΓΗ ΤΥΠΟΥ
+    frame_channels::Dict{UInt32, Channel{Union{HTTP2Frame, CleanupStream}}}
     pending_streams::PriorityQueue{UInt32, Int}
     role::ConnectionRole
     next_stream_id::UInt32
     max_concurrent_streams::UInt32
-    
-    # ΔΙΟΡΘΩΣΗ: Δηλώνουμε τον ακριβή, παραμετρικό τύπο.
     send_condition::Base.GenericCondition{ReentrantLock}
-    
     send_lock::ReentrantLock
     send_task::Union{Task, Nothing}
 end
 
-"""
-    HTTP2Connection
+# ============================================================================
+# CONNECTION MANAGEMENT
+# ============================================================================
 
-Main connection type that manages an HTTP/2 connection.
 """
+    HTTP2Connection <: AbstractHTTP2Connection
 
-mutable struct HTTP2Connection <: AbstractHTTP2Connection # Mutable struct για κύρια σύνδεση HTTP/2
-    # --- Const Fields --- # Σταθερά πεδία
-    const id::String # <--- ΝΕΟ ΠΕΔΙΟ
-    const socket::IO # Σταθερό socket για I/O
-    const role::ConnectionRole # Σταθερός ρόλος σύνδεσης
-    const settings::HTTP2Settings # Σταθερές ρυθμίσεις σύνδεσης
-    const streams::Dict{UInt32, HTTP2Stream} # Σταθερό dictionary των streams
+Main connection type that manages an HTTP/2 connection with full state tracking,
+stream multiplexing, HPACK compression, and flow control.
+
+# Constant Fields
+- `id::String`: Unique connection identifier
+- `socket::IO`: Underlying network socket
+- `role::ConnectionRole`: Connection role (client or server)
+- `settings::HTTP2Settings`: Local connection settings
+- `streams::Dict{UInt32, HTTP2Stream}`: Active streams by ID
+- `hpack_encoder::HPACKEncoder`: HPACK header compressor
+- `hpack_decoder::HPACKDecoder`: HPACK header decompressor
+- `frame_channel::Channel{HTTP2Frame}`: Channel for incoming frames
+- `preface_handshake_done::Condition`: Condition for preface completion
+- `header_buffer::IOBuffer`: Buffer for header processing
+
+# Mutable Fields
+- `host::String`: Remote host address
+- `port::Int64`: Remote port number
+- `state::ConnectionState`: Current connection state
+- `remote_settings::HTTP2Settings`: Remote peer settings
+- `last_stream_id::UInt32`: Last locally-initiated stream ID
+- `last_peer_stream_id::UInt32`: Last peer-initiated stream ID
+- `receive_window::Int32`: Connection-level receive window
+- `send_window::Int32`: Connection-level send window
+- `preface_sent::Bool`: Whether connection preface was sent
+- `preface_received::Bool`: Whether connection preface was received
+- `goaway_sent::Bool`: Whether GOAWAY frame was sent
+- `goaway_received::Bool`: Whether GOAWAY frame was received
+- `last_error::Union{Nothing, ConnectionError}`: Last connection error
+- `continuation_stream_id::UInt32`: Stream ID for CONTINUATION frames
+- `continuation_end_stream::Bool`: END_STREAM flag for CONTINUATION
+- `lock::ReentrantLock`: Main connection lock
+- `decoder_lock::ReentrantLock`: HPACK decoder lock
+- `pending_pings::Dict{UInt64, Tuple{Float64, Channel{Float64}}}`: Pending PING frames
+- `callbacks::Dict{Symbol, Function}`: Event callbacks
+- `request_handler::Union{Any, Nothing}`: Request handler function
+- `multiplexer::StreamMultiplexer`: Stream multiplexer
+- `done_condition::Condition`: Condition for connection completion
+- `client_connection_id::Union{String, Nothing}`: Client-specific connection ID
+- `rate_limiter::TokenBucket`: Rate limiter for connection
+"""
+mutable struct HTTP2Connection <: AbstractHTTP2Connection
+    # Constant fields
+    const id::String
+    const socket::IO
+    const role::ConnectionRole
+    const settings::HTTP2Settings
+    const streams::Dict{UInt32, HTTP2Stream}
     const hpack_encoder::HPACKEncoder
     const hpack_decoder::HPACKDecoder
-    const frame_channel::Channel{HTTP2Frame} # Σταθερό κανάλι για frames
-    const preface_handshake_done::Condition # Σταθερή συνθήκη για handshake
-    const header_buffer::IOBuffer # Σταθερό buffer για headers
+    const frame_channel::Channel{HTTP2Frame}
+    const preface_handshake_done::Condition
+    const header_buffer::IOBuffer
 
-
-    # --- Mutable Fields --- # Μεταβλητά πεδία
-    host::String  # <--- NEW FIELD
-    port::Int64     # <--- NEW FIELD
-    state::ConnectionState # Κατάσταση σύνδεσης
-    remote_settings::HTTP2Settings # Ρυθμίσεις του remote peer
-    last_stream_id::UInt32 # Τελευταίο χρησιμοποιημένο stream ID
-    last_peer_stream_id::UInt32 # Τελευταίο stream ID από peer
-    receive_window::Int32 # Παράθυρο λήψης σύνδεσης
-    send_window::Int32 # Παράθυρο αποστολής σύνδεσης
-    preface_sent::Bool # Flag για αποστολή preface
-    preface_received::Bool # Flag για λήψη preface
-    goaway_sent::Bool # Flag για αποστολή GOAWAY
-    goaway_received::Bool # Flag για λήψη GOAWAY
-    last_error::Union{Nothing, ConnectionError} # Τελευταίο σφάλμα ή Nothing
-    continuation_stream_id::UInt32 # Stream ID για CONTINUATION frames
-    continuation_end_stream::Bool # Flag για τέλος CONTINUATION
-    lock::ReentrantLock # Lock για thread safety
-    decoder_lock::ReentrantLock # Lock για thread safety
-    pending_pings::Dict{UInt64, Tuple{Float64, Channel{Float64}}} # Dictionary για pending PINGs
-    callbacks::Dict{Symbol, Function} # Dictionary για callbacks
-    request_handler::Union{Any, Nothing} # Handler για αιτήματα ή Nothing
-    multiplexer::StreamMultiplexer # Πολυπλέκτης streams
+    # Mutable fields
+    host::String
+    port::Int64
+    state::ConnectionState
+    remote_settings::HTTP2Settings
+    last_stream_id::UInt32
+    last_peer_stream_id::UInt32
+    receive_window::Int32
+    send_window::Int32
+    preface_sent::Bool
+    preface_received::Bool
+    goaway_sent::Bool
+    goaway_received::Bool
+    last_error::Union{Nothing, ConnectionError}
+    continuation_stream_id::UInt32
+    continuation_end_stream::Bool
+    lock::ReentrantLock
+    decoder_lock::ReentrantLock
+    pending_pings::Dict{UInt64, Tuple{Float64, Channel{Float64}}}
+    callbacks::Dict{Symbol, Function}
+    request_handler::Union{Any, Nothing}
+    multiplexer::StreamMultiplexer
     done_condition::Condition
     client_connection_id::Union{String, Nothing}
     rate_limiter::TokenBucket
-    
 
     function HTTP2Connection(socket::IO, role::ConnectionRole, settings::HTTP2Settings, host::String, port::Int64; 
                         request_handler::Union{Any, Nothing}=nothing,
                         client_connection_id::Union{String, Nothing}=nothing)
     
-    # Δημιουργία βασικών στοιχείων
-    conn_id = string(uuid4())
-    streams = Dict{UInt32, HTTP2Stream}()
-    encoder = HPACKEncoder(settings.header_table_size)
-    decoder = HPACKDecoder(UInt32(DEFAULT_HEADER_TABLE_SIZE)) 
-    frame_channel = Channel{HTTP2Frame}(128)
-    preface_handshake_done = Condition()
-    header_buffer = IOBuffer()
+        # Create basic components
+        conn_id = string(uuid4())
+        streams = Dict{UInt32, HTTP2Stream}()
+        encoder = HPACKEncoder(settings.header_table_size)
+        decoder = HPACKDecoder(UInt32(DEFAULT_HEADER_TABLE_SIZE)) 
+        frame_channel = Channel{HTTP2Frame}(128)
+        preface_handshake_done = Condition()
+        header_buffer = IOBuffer()
 
-    # Δημιουργία σύνδεσης με τα βασικά πεδία
-    conn = new(conn_id, socket, role, settings, streams,encoder, decoder,
-               frame_channel, preface_handshake_done, header_buffer, host, port)
+        # Create connection with basic fields
+        conn = new(conn_id, socket, role, settings, streams, encoder, decoder,
+                   frame_channel, preface_handshake_done, header_buffer, host, port)
 
-    # Αρχικοποίηση state fields
-    conn.state = CONNECTION_IDLE
-    conn.remote_settings = HTTP2Settings()
-    conn.last_stream_id = role == CLIENT ? UInt32(1) : UInt32(2)
-    conn.last_peer_stream_id = UInt32(0)
-    conn.receive_window = Int32(settings.initial_window_size)
-    conn.send_window = Int32(DEFAULT_WINDOW_SIZE)
-    conn.preface_sent = false
-    conn.preface_received = false
-    conn.goaway_sent = false
-    conn.goaway_received = false
-    conn.last_error = nothing
-    conn.continuation_stream_id = UInt32(0)
-    conn.continuation_end_stream = false
-    conn.lock = ReentrantLock()
-    conn.decoder_lock = ReentrantLock()
-    conn.pending_pings = Dict{UInt64, Tuple{Float64, Channel{Float64}}}()
-    conn.callbacks = Dict{Symbol, Function}()
-    conn.request_handler = request_handler
-    
-    # ΝΕΟ: Αρχικοποίηση client connection ID
-    conn.client_connection_id = client_connection_id
+        # Initialize state fields
+        conn.state = CONNECTION_IDLE
+        conn.remote_settings = HTTP2Settings()
+        conn.last_stream_id = role == CLIENT ? UInt32(1) : UInt32(2)
+        conn.last_peer_stream_id = UInt32(0)
+        conn.receive_window = Int32(settings.initial_window_size)
+        conn.send_window = Int32(DEFAULT_WINDOW_SIZE)
+        conn.preface_sent = false
+        conn.preface_received = false
+        conn.goaway_sent = false
+        conn.goaway_received = false
+        conn.last_error = nothing
+        conn.continuation_stream_id = UInt32(0)
+        conn.continuation_end_stream = false
+        conn.lock = ReentrantLock()
+        conn.decoder_lock = ReentrantLock()
+        conn.pending_pings = Dict{UInt64, Tuple{Float64, Channel{Float64}}}()
+        conn.callbacks = Dict{Symbol, Function}()
+        conn.request_handler = request_handler
+        conn.client_connection_id = client_connection_id
 
-    # Δημιουργία multiplexer
-    mux = StreamMultiplexer(conn, role, settings)
-    conn.multiplexer = mux
-    conn.done_condition = Condition()
-    conn.rate_limiter = TokenBucket(100, 10)
-    
-    return conn
-        end
+        # Create multiplexer
+        mux = StreamMultiplexer(conn, role, settings)
+        conn.multiplexer = mux
+        conn.done_condition = Condition()
+        conn.rate_limiter = TokenBucket(100, 10)
+        
+        return conn
     end
-
-# Constructor για το HTTP2Stream # Constructor για HTTP2Stream
-function HTTP2Stream(id::Integer, conn::HTTP2Connection) # Συνάρτηση constructor με ID και connection
-        initial_window_size = conn.settings.initial_window_size # Παίρνει το αρχικό μέγεθος παραθύρου
-
-        # 1. Δημιουργούμε τον buffer ΡΗΤΑ και ΑΝΕΞΑΡΤΗΤΑ 
-        the_buffer = IOBuffer() # Δημιουργεί νέο IOBuffer
-
-        # 2. Καλούμε τη περνώντας το αντικείμενο που ήδη φτιάξαμε # Καλούμε constructor με έτοιμο αντικείμενο
-        stream = HTTP2Stream( # Δημιουργεί νέο stream
-            UInt32(id),                 # id # Μετατρέπει ID σε UInt32
-            conn,                       # connection # Περνάει τη σύνδεση
-            STREAM_IDLE,                # state # Αρχική κατάσταση IDLE
-            Int32(initial_window_size), # receive_window # Παράθυρο λήψης
-            Int32(initial_window_size), # send_window # Παράθυρο αποστολής
-            nothing,                    # parent # Κανένα γονικό stream
-            HTTP2Stream[],              # children # Κενό διάνυσμα παιδιών
-            StreamPriority(),           # priority # Προεπιλεγμένη προτεραιότητα
-            Pair{String, String}[],     # headers # Κενό διάνυσμα headers
-            the_buffer,                 # data_buffer (το έτοιμο αντικείμενο) # Το έτοιμο buffer
-            false,                      # end_stream_received # Flag για λήψη τέλους
-            false,                      # end_stream_sent # Flag για αποστολή τέλους
-            now(),                      # created_at # Τρέχουσα ημερομηνία δημιουργίας
-            now(),                      # last_activity # Τρέχουσα ημερομηνία δραστηριότητας
-            ReentrantLock(),            # buffer_lock # Lock για το buffer
-            Base.GenericCondition(conn.lock),                # data_available # Συνθήκη για δεδομένα
-            Base.GenericCondition(conn.lock)                # headers_available # Συνθήκη για headers
-        )
-
-        return stream # Επιστρέφει το νέο stream
 end
 
+# ============================================================================
+# CONSTRUCTOR FUNCTIONS
+# ============================================================================
 
+"""
+    HTTP2Stream(id::Integer, conn::HTTP2Connection) -> HTTP2Stream
+
+Create a new HTTP/2 stream with the given ID and parent connection.
+Initializes the stream in IDLE state with default flow control windows.
+"""
+function HTTP2Stream(id::Integer, conn::HTTP2Connection)
+    initial_window_size = conn.settings.initial_window_size
+    the_buffer = IOBuffer()
+
+    stream = HTTP2Stream(
+        UInt32(id),
+        conn,
+        STREAM_IDLE,
+        Int32(initial_window_size),
+        Int32(initial_window_size),
+        nothing,
+        HTTP2Stream[],
+        StreamPriority(),
+        Pair{String, String}[],
+        the_buffer,
+        false,
+        false,
+        now(),
+        now(),
+        ReentrantLock(),
+        Base.GenericCondition(conn.lock),
+        Base.GenericCondition(conn.lock)
+    )
+
+    return stream
+end
+
+"""
+    StreamMultiplexer(conn::HTTP2Connection, role::ConnectionRole, settings::HTTP2Settings) -> StreamMultiplexer
+
+Create a new stream multiplexer for the given connection.
+"""
 function StreamMultiplexer(conn::HTTP2Connection, role::ConnectionRole, settings::HTTP2Settings)
     lock = ReentrantLock()
     channels = Dict{UInt32, Channel{Union{HTTP2Frame, CleanupStream}}}()
@@ -399,7 +626,7 @@ function StreamMultiplexer(conn::HTTP2Connection, role::ConnectionRole, settings
     
     StreamMultiplexer(
         conn,
-        channels, # <--- Η αλλαγή είναι εδώ
+        channels,
         PriorityQueue{UInt32, Int}(Base.Order.Reverse),
         role,
         role == CLIENT ? UInt32(1) : UInt32(2),
@@ -410,40 +637,63 @@ function StreamMultiplexer(conn::HTTP2Connection, role::ConnectionRole, settings
     )
 end
 
-function HTTP2Connection(socket::IO, role::ConnectionRole, settings::HTTP2Settings, 
-                        auto_generate_client_id::Bool; 
-                        request_handler::Union{Any, Nothing}=nothing)
-    
+"""
+    HTTP2Connection(socket::IO, role::ConnectionRole, settings::HTTP2Settings, auto_generate_client_id::Bool; request_handler=nothing) -> HTTP2Connection
+
+Create a new HTTP/2 connection with optional automatic client ID generation.
+"""
+function HTTP2Connection(socket::IO, role::ConnectionRole, settings::HTTP2Settings, auto_generate_client_id::Bool; request_handler::Union{Any, Nothing}=nothing)
     client_id = auto_generate_client_id ? generate_unique_client_id() : nothing
-    
-    return HTTP2Connection(socket, role, settings; 
-                          request_handler=request_handler,
-                          client_connection_id=client_id)
+    return HTTP2Connection(socket, role, settings; request_handler=request_handler, client_connection_id=client_id)
 end
 
-# ============================================================================= 
-# Utility Functions # Βοηθητικές συναρτήσεις
-# ============================================================================= 
+# ============================================================================
+# CLIENT CONNECTION ID MANAGEMENT
+# ============================================================================
 
+"""
+    generate_unique_client_id() -> String
 
+Generate a unique client connection identifier using timestamp and random components.
+"""
 function generate_unique_client_id()
-    timestamp = string(Dates.now())  # milliseconds
+    timestamp = string(Dates.now())
     random_part = string(rand(UInt32), base=16)
     return "client_$(timestamp)_$(random_part)"
 end
 
+"""
+    set_client_connection_id!(conn::HTTP2Connection, client_id::String)
+
+Set the client connection ID for the given connection.
+"""
 function set_client_connection_id!(conn::HTTP2Connection, client_id::String)
     conn.client_connection_id = client_id
 end
 
+"""
+    get_client_connection_id(conn::HTTP2Connection) -> Union{String, Nothing}
+
+Get the client connection ID for the given connection, or nothing if not set.
+"""
 function get_client_connection_id(conn::HTTP2Connection)
     return conn.client_connection_id
 end
 
+"""
+    has_client_connection_id(conn::HTTP2Connection) -> Bool
+
+Check whether the connection has a client connection ID set.
+"""
 function has_client_connection_id(conn::HTTP2Connection)
     return !isnothing(conn.client_connection_id)
 end
 
+"""
+    debug_connection_info(conn::HTTP2Connection)
+
+Print detailed debug information about the connection state and associated client.
+"""
 function debug_connection_info(conn::HTTP2Connection)
     client_id = get_client_connection_id(conn)
     @info ("=== HTTP2Connection Debug Info ===")
@@ -465,47 +715,55 @@ function debug_connection_info(conn::HTTP2Connection)
     @info ("=================================")
 end
 
+# ============================================================================
+# DISPLAY METHODS
+# ============================================================================
+
 """
     show(io::IO, header::FrameHeader)
 
-Pretty print frame header information.
+Pretty print frame header information with length, type, flags, and stream ID.
 """
-function Base.show(io::IO, header::FrameHeader) # Συνάρτηση για εμφάνιση FrameHeader
-    print(io, "FrameHeader(length=$(header.length), type=$(header.frame_type), " * # Τυπώνει length και type
-              "flags=0x$(string(header.flags, base=16, pad=2)), " * # Τυπώνει flags σε hex
-              "stream_id=$(header.stream_id))") # Τυπώνει stream ID
+function Base.show(io::IO, header::FrameHeader)
+    print(io, "FrameHeader(length=$(header.length), type=$(header.frame_type), " *
+              "flags=0x$(string(header.flags, base=16, pad=2)), " *
+              "stream_id=$(header.stream_id))")
 end
 
 """
     show(io::IO, stream::HTTP2Stream)
 
-Pretty print stream information.
+Pretty print stream information including ID, state, and flow control windows.
 """
-function Base.show(io::IO, stream::HTTP2Stream) # Συνάρτηση για εμφάνιση HTTP2Stream
-    print(io, "HTTP2Stream(id=$(stream.id), state=$(stream.state), " * # Τυπώνει ID και κατάσταση
-              "receive_window=$(stream.receive_window), " * # Τυπώνει τοπικό παράθυρο
-              "send_window=$(stream.send_window))") # Τυπώνει απομακρυσμένο παράθυρο
+function Base.show(io::IO, stream::HTTP2Stream)
+    print(io, "HTTP2Stream(id=$(stream.id), state=$(stream.state), " *
+              "receive_window=$(stream.receive_window), " *
+              "send_window=$(stream.send_window))")
 end
 
 """
     show(io::IO, conn::HTTP2Connection)
 
-Pretty print connection information.
+Pretty print connection information including role, state, active streams, and send window.
 """
-function Base.show(io::IO, conn::HTTP2Connection) # Συνάρτηση για εμφάνιση HTTP2Connection
-    role = (conn.role == SERVER) ? "server" : "client" # Καθορίζει το string του ρόλου
-    print(io, "HTTP2Connection($role, state=$(conn.state), " * # Τυπώνει ρόλο και κατάσταση
-              "streams=$(length(conn.streams)), " * # Τυπώνει αριθμό streams
-              "window=$(conn.send_window))") # Τυπώνει μέγεθος παραθύρου
+function Base.show(io::IO, conn::HTTP2Connection)
+    role = (conn.role == SERVER) ? "server" : "client"
+    print(io, "HTTP2Connection($role, state=$(conn.state), " *
+              "streams=$(length(conn.streams)), " *
+              "window=$(conn.send_window))")
 end
 
+# ============================================================================
+# STREAM ACCESS METHODS
+# ============================================================================
+
 """
-    get_stream(conn::HTTP2Connection, stream_id::Integer)
+    get_stream(conn::HTTP2Connection, stream_id::Integer) -> Union{HTTP2Stream, Nothing}
 
 Get stream by ID from connection, returns nothing if not found.
 """
-function get_stream(conn::HTTP2Connection, stream_id::Integer) # Συνάρτηση για λήψη stream από σύνδεση
-    return get(conn.streams, UInt32(stream_id), nothing) # Επιστρέφει stream ή nothing
+function get_stream(conn::HTTP2Connection, stream_id::Integer)
+    return get(conn.streams, UInt32(stream_id), nothing)
 end
 
 """
@@ -513,20 +771,26 @@ end
 
 Check if connection has stream with given ID.
 """
-function has_stream(conn::HTTP2Connection, stream_id::Integer) # Συνάρτηση για έλεγχο ύπαρξης stream
-    return haskey(conn.streams, UInt32(stream_id)) # Επιστρέφει true αν υπάρχει το stream
+function has_stream(conn::HTTP2Connection, stream_id::Integer)
+    return haskey(conn.streams, UInt32(stream_id))
 end
 
 """
-    next_stream_id!(conn::HTTP2Connection) -> Int32
+    next_stream_id!(conn::HTTP2Connection) -> UInt32
 
 Generate next valid stream ID for this connection.
+Increments by 2 to maintain client/server stream ID separation.
 """
-function next_stream_id!(conn::HTTP2Connection) # Συνάρτηση για δημιουργία επόμενου stream ID
-    current = conn.next_stream_id # Παίρνει το τρέχον stream ID
-    conn.next_stream_id += 2   # Προσθέτει 2 για διατήρηση μονού/ζυγού pattern
-    return current # Επιστρέφει το τρέχον ID
+function next_stream_id!(conn::HTTP2Connection)
+    current = conn.next_stream_id
+    conn.next_stream_id += 2
+    return current
 end
+
+# ============================================================================
+# IO INTERFACE FOR STREAMS
+# ============================================================================
+
 
 """
     Base.read(s::HTTP2Stream, nb::Integer)
@@ -599,5 +863,4 @@ is_closed(conn::AbstractHTTP2Connection) = conn.state == CONNECTION_CLOSED
 is_going_away(conn::AbstractHTTP2Connection) = conn.state in (CONNECTION_GOAWAY_SENT, CONNECTION_GOAWAY_RECEIVED)
 is_active(stream::HTTP2Stream) = stream.state != STREAM_CLOSED
 
-    
 end
