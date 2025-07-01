@@ -34,7 +34,6 @@ Contains both local and remote settings with proper validation.
     enable_connect_protocol::Bool = false
 end
 
-# Validation function
 function validate_http2_settings!(settings::HTTP2Settings)
     # Validate according to RFC 7540
     settings.initial_window_size > 2147483647 && throw(FlowControlError("SETTINGS_INITIAL_WINDOW_SIZE must not exceed 2^31-1"))
@@ -42,7 +41,6 @@ function validate_http2_settings!(settings::HTTP2Settings)
     return settings
 end
 
-# Constructor with automatic validation
 function HTTP2Settings(args...; kwargs...)
     settings = HTTP2Settings(args...; kwargs...)
     return validate_http2_settings!(settings)
@@ -56,12 +54,10 @@ Updates the `settings` object with parameters from an incoming SETTINGS frame.
 Performs validation for each parameter. Ignores ACK frames.
 """
 function apply_settings!(settings::HTTP2Settings, frame::SettingsFrame)
-    frame.ack && return  # ACK frames just confirm, don't change settings
+    frame.ack && return  
 
     for (param_id, value) in frame.parameters
         param_enum = SettingsParameter(param_id)
-        
-        # Validate and update based on parameter type
         if param_enum == SETTINGS_HEADER_TABLE_SIZE
             settings.header_table_size = UInt32(value)
         elseif param_enum == SETTINGS_ENABLE_PUSH
@@ -222,9 +218,7 @@ Create default settings appropriate for an HTTP/2 client.
 """
 function create_client_settings()
     settings = HTTP2Settings()
-    # Clients typically don't need server push
     settings.enable_push = false
-    # Set reasonable limits for client
     settings.max_concurrent_streams = 100
     settings.max_header_list_size = 8192
     return settings
@@ -238,7 +232,7 @@ Create default settings appropriate for an HTTP/2 server.
 function create_server_settings(; max_concurrent_streams::Integer = 1000)::HTTP2Settings
     settings = HTTP2Settings()
     settings.enable_push = true
-    settings.max_concurrent_streams = UInt32(max_concurrent_streams) # <-- Δυναμική τιμή
+    settings.max_concurrent_streams = UInt32(max_concurrent_streams) 
     settings.max_header_list_size = 16384
     settings.max_frame_size = 32768
     return settings

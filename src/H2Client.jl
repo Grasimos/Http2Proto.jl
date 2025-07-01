@@ -19,16 +19,11 @@ end
 
 """
     connect(host, port; ...) -> HTTP2Client
-
-**REFACTOR**: Η συνάρτηση τώρα χρησιμοποιεί την κεντρική `tls_connect`
-για να αποφύγει την επανάληψη κώδικα.
 """
 function connect(host::String, port::Int64; is_tls=true, timeout=10.0, kwargs...)
     local socket::IO
     
     if is_tls
-        # **REFACTOR**: Αντί να έχουμε όλη τη λογική του MbedTLS εδώ,
-        # απλώς καλούμε τη βοηθητική μας συνάρτηση.
         socket = H2TLSIntegration.tls_connect(host, port; verify_peer=get(kwargs, :verify_peer, false))
     else
         socket = Sockets.connect(host, port)
@@ -104,14 +99,6 @@ function close(client::HTTP2Client)
     end
 end
 
-# function create_client_settings()
-#     return HTTP2Settings(
-#         enable_push=true,
-#         max_concurrent_streams=100,
-#         max_header_list_size=8192
-#     )
-# end
-
 """
     ping(client::HTTP2Client; timeout=10.0) -> Float64
 
@@ -119,8 +106,6 @@ Sends a PING frame to the server and waits for the acknowledgment,
 returning the round-trip time (RTT) in seconds.
 Throws an error on timeout.
 """
-
-# [FINAL, CORRECTED ping function] in H2.jl/src/H2Client.jl
 
 function ping(client::HTTP2Client; timeout::Float64=10.0)
     conn = client.conn

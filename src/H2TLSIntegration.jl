@@ -15,7 +15,6 @@ function tls_accept(tcp_socket::TCPSocket;
     
     conf = MbedTLS.SSLConfig(cert_file, key_file)
 
-    # **THE FIX**: Χρησιμοποιούμε τα σωστά keyword arguments που μας υπέδειξε το σφάλμα.
     MbedTLS.config_defaults!(conf,
                              endpoint=MbedTLS.MBEDTLS_SSL_IS_SERVER,
                              transport=MbedTLS.MBEDTLS_SSL_TRANSPORT_STREAM)
@@ -75,4 +74,4 @@ function tls_connect(host::AbstractString, port::Integer; alpn_protocols=ALPN_PR
     return ssl_context
 end
 
-end # module HTTP2TLSIntegration
+end 
