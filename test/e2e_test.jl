@@ -66,17 +66,11 @@ using H2
     end)
 
     HTTP.register!(E2E_ROUTER, "GET", "/shutdown", req -> begin
-        # Πρώτα, δημιουργούμε την απάντηση που θα στείλουμε
         response = HTTP.Response(200, "I'm shutting down!")
         
-        # Παίρνουμε τη σύνδεση και το stream ID από το context του request
         conn = req.context[:stream].connection
         last_processed_id = req.context[:stream].id
         
-        # Τώρα, επιστρέφουμε την κανονική απάντηση. Ο αντάπτορας θα βάλει τα
-        # HEADERS(200) και DATA frames στην ουρά για αποστολή.
-        # Αμέσως μετά, θα στείλουμε και το GOAWAY.
-        # Ο send_loop θα τα στείλει με τη σειρά.
         H2.Connection.send_goaway!(conn, last_processed_id, :NO_ERROR)
         
         return response
@@ -89,8 +83,8 @@ using H2
     
     startup_channel = Channel{Bool}(1)
     
-    CERT_PATH = joinpath(@__DIR__, "../cert.pem")
-    KEY_PATH = joinpath(@__DIR__, "../key.pem")
+    CERT_PATH = get(ENV, "CERT_PATH", joinpath(@__DIR__, "../cert.pem"))
+    KEY_PATH = get(ENV, "KEY_PATH", joinpath(@__DIR__, "../key.pem"))
 
     server_task = errormonitor(@async H2.serve(
         h2_handler, 

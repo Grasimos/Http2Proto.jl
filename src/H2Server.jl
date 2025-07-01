@@ -72,11 +72,11 @@ function handle_new_connection(sock::IO, settings::HTTP2Settings, handler, host:
         
         while isopen(conn.socket)
             yield()
-            sleep(0.01) # Αποφυγή spin-loop
+            sleep(0.01) 
         end
 
     catch e
-        if !(e isa EOFError || (e isa Base.IOError && e.code in (-54, -104))) # Αγνοούμε τυπικά σφάλματα κλεισίματος
+        if !(e isa EOFError || (e isa Base.IOError && e.code in (-54, -104))) 
             @error "Connection setup failed" exception=(e, catch_backtrace())
         end
     finally
@@ -171,4 +171,4 @@ function route(handler_map::Dict{String,HTTP2Handler}, req::HTTP2Request)
     return handle_request(h, req)
 end
 
-end # module HTTP2ServerHandler
+end 

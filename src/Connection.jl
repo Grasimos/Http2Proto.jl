@@ -678,7 +678,6 @@ end
 Handles a received PUSH_PROMISE frame.
 """
 function process_push_promise(conn::HTTP2Connection, frame::PushPromiseFrame)
-    # Βρίσκουμε το αρχικό stream
     original_stream = get_stream(conn, frame.stream_id)
     if original_stream === nothing || !is_active(original_stream)
         return
@@ -765,7 +764,6 @@ to update the local flow control windows.
 # Connection Logic
 function apply_flow_control_update(frame::WindowUpdateFrame, conn::HTTP2Connection)
     if frame.stream_id == 0
-        # --- ΔΙΟΡΘΩΣΗ: Καλούμε τη σωστή συνάρτηση από το FlowControl ---
         update_send_window!(conn, frame.window_size_increment)
     else
         stream = get_stream(conn, frame.stream_id)
@@ -818,7 +816,6 @@ This function is thread-safe.
 """
 function close_connection!(conn::HTTP2Connection, error_code::Symbol = :NO_ERROR, debug_message::String = "")
     @lock conn.lock begin
-        # Send GOAWAY frame if connection is open
         if isopen(conn.socket)
             last_stream_id = get_highest_stream_id(conn) |> UInt32
             send_goaway!(conn, last_stream_id, error_code, debug_message)
