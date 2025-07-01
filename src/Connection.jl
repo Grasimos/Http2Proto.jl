@@ -22,7 +22,7 @@ export is_client, is_server, next_stream_id, add_stream, get_stream, remove_stre
 
 function send_loop(mux::StreamMultiplexer)
     role = is_client(mux.conn) ? "CLIENT" : "SERVER" 
-    @info "[$role][T$(threadid())] SendLoop: Starting."
+    @debug "[$role][T$(threadid())] SendLoop: Starting."
     try 
         while !is_closed(mux.conn)
             local item_to_send::Union{HTTP2Frame, CleanupStream, Nothing} = nothing
@@ -30,7 +30,7 @@ function send_loop(mux::StreamMultiplexer)
             
             @lock mux.send_lock begin
                 while isempty(mux.pending_streams) && !is_closed(mux.conn)
-                    @info "[$role][T$(threadid())] SendLoop: Queue empty, waiting on condition..."
+                    @debug "[$role][T$(threadid())] SendLoop: Queue empty, waiting on condition..."
                     wait(mux.send_condition)
                 end
 
@@ -53,7 +53,7 @@ function send_loop(mux::StreamMultiplexer)
             end 
 
             if item_to_send isa HTTP2Frame
-                @info "[$role][T$(threadid())] SendLoop: Sending frame $(item_to_send)" 
+                @debug "[$role][T$(threadid())] SendLoop: Sending frame $(item_to_send)" 
                 try
                     send_frame(mux.conn, serialize_frame(item_to_send))
                 catch e
@@ -62,7 +62,7 @@ function send_loop(mux::StreamMultiplexer)
                     break
                 end
             elseif item_to_send isa CleanupStream
-                @info "[$role][T$(threadid())] SendLoop: Cleaning up stream $(stream_id_to_process)."
+                @debug "[$role][T$(threadid())] SendLoop: Cleaning up stream $(stream_id_to_process)."
                 @lock mux.send_lock begin
                     delete!(mux.conn.streams, stream_id_to_process)
                     channel_to_close = pop!(mux.frame_channels, stream_id_to_process, nothing)
@@ -79,13 +79,13 @@ function send_loop(mux::StreamMultiplexer)
             @error "[$role][T$(threadid())] SendLoop: Unhandled exception." exception=(ex, catch_backtrace())
         end
     finally
-        @info "[$role][T$(threadid())] SendLoop: Shutdown."
+        @debug "[$role][T$(threadid())] SendLoop: Shutdown."
     end
 end
 
 function send_headers!(stream::HTTP2Stream, headers::Vector{<:Pair{<:AbstractString, <:AbstractString}}; end_stream::Bool=false)
     role = stream.connection.role
-    @info "[$role][T$(threadid())] Stream $(stream.id): Queueing HEADERS" headers=headers end_stream=end_stream
+    @debug "[$role][T$(threadid())] Stream $(stream.id): Queueing HEADERS" headers=headers end_stream=end_stream
 
     final_headers = [lowercase(String(k)) => String(v) for (k, v) in headers]
     @lock stream.connection.lock begin
@@ -99,12 +99,12 @@ function send_headers!(stream::HTTP2Stream, headers::Vector{<:Pair{<:AbstractStr
 
     send_frame(stream.connection, serialize_frame(frame))
     end
-    @info "[$role][T$(threadid())] Stream $(stream.id): HEADERS frame queued."
+    @debug "[$role][T$(threadid())] Stream $(stream.id): HEADERS frame queued."
 end
 
 function send_data!(stream::HTTP2Stream, data::Vector{UInt8}; end_stream::Bool=false)
     role = is_client(stream.connection) ? "CLIENT" : "SERVER"
-    @info "[$role][T$(threadid())] Stream $(stream.id): Queueing DATA" bytes=length(data) end_stream=end_stream
+    @debug "[$role][T$(threadid())] Stream $(stream.id): Queueing DATA" bytes=length(data) end_stream=end_stream
 
     transition_stream_state!(stream, :send_data)
     
@@ -135,19 +135,19 @@ end
 
 function receive_headers!(stream::HTTP2Stream, headers::Vector{<:Pair{<:AbstractString, <:AbstractString}}; end_stream::Bool=false)
     role = is_client(stream.connection) ? "CLIENT" : "SERVER"
-    @info "[$role][T$(threadid())] Stream $(stream.id): Receiving HEADERS, acquiring lock..."
+    @debug "[$role][T$(threadid())] Stream $(stream.id): Receiving HEADERS, acquiring lock..."
     
     @lock stream.connection.lock begin
-        @info "[$role][T$(threadid())] Stream $(stream.id): Acquired lock. Setting headers."
+        @debug "[$role][T$(threadid())] Stream $(stream.id): Acquired lock. Setting headers."
         stream.headers = headers
         transition_stream_state!(stream, :recv_headers)
         if end_stream
-            @info "[$role][T$(threadid())] Stream $(stream.id): END_STREAM flag received with headers."
+            @debug "[$role][T$(threadid())] Stream $(stream.id): END_STREAM flag received with headers."
             stream.end_stream_received = true
         end
-        @info "[$role][T$(threadid())] Stream $(stream.id): Notifying headers_available (inside lock)."
+        @debug "[$role][T$(threadid())] Stream $(stream.id): Notifying headers_available (inside lock)."
         notify(stream.headers_available; all=true)
-        @info "[$role][T$(threadid())] Stream $(stream.id): Releasing lock after notify."
+        @debug "[$role][T$(threadid())] Stream $(stream.id): Releasing lock after notify."
     end
     update_activity!(stream)
 end
@@ -156,7 +156,7 @@ end
 
 function receive_data!(stream::HTTP2Stream, data::Vector{UInt8}; end_stream::Bool=false)
     role = is_client(stream.connection) ? "CLIENT" : "SERVER" 
-    @info "[$role][T$(threadid())] Stream $(stream.id): Receiving DATA (bytes: $(length(data)))"
+    @debug "[$role][T$(threadid())] Stream $(stream.id): Receiving DATA (bytes: $(length(data)))"
 
     if length(data) > stream.receive_window || length(data) > stream.connection.receive_window 
         throw(FlowControlError("Received more data than the advertised window size", stream.id))
@@ -168,7 +168,7 @@ function receive_data!(stream::HTTP2Stream, data::Vector{UInt8}; end_stream::Boo
         write(stream.data_buffer, data)
         transition_stream_state!(stream, :recv_data)
         if end_stream
-             @info "[$role][T$(threadid())] Stream $(stream.id): END_STREAM flag received with data." 
+             @debug "[$role][T$(threadid())] Stream $(stream.id): END_STREAM flag received with data." 
              stream.end_stream_received = true
         end
         notify(stream.data_available; all=true)
@@ -265,7 +265,7 @@ end
 
 function io_loop_with_client_info(conn::HTTP2Connection, conn_id::String)
     role = conn.role
-    @info "IO Loop: Starting for Role: $role, ID: $conn_id"
+    @debug "IO Loop: Starting for Role: $role, ID: $conn_id"
 
     try
         while isopen(conn.socket) && !eof(conn.socket)
@@ -273,14 +273,14 @@ function io_loop_with_client_info(conn::HTTP2Connection, conn_id::String)
             if length(header_bytes) < 9; break; end
             
             header = H2Frames.deserialize_frame_header(header_bytes)
-            @info "IO Loop ($role): Received frame header - Type: $(header.frame_type)), Stream: $(header.stream_id), Length: $(header.length)"
+            @debug "IO Loop ($role): Received frame header - Type: $(header.frame_type)), Stream: $(header.stream_id), Length: $(header.length)"
             
             payload_bytes = read(conn.socket, header.length)
             if length(payload_bytes) < header.length; break; end
             
             frame = H2Frames.create_frame(header, payload_bytes)
             
-            @info "IO Loop ($role): Received full frame, queueing for processing -> Type: $(frame))"
+            @debug "IO Loop ($role): Received full frame, queueing for processing -> Type: $(frame))"
             put!(conn.frame_channel, frame)
             
             yield()
@@ -289,23 +289,23 @@ function io_loop_with_client_info(conn::HTTP2Connection, conn_id::String)
         if !(e isa EOFError || (e isa Base.IOError && e.code in (-54, -32))) # -54: ECONNRESET, -32: EPIPE
             @error "IO Loop Exception ($role, ID: $conn_id)" exception=(e, catch_backtrace())
         else
-            @info "IO Loop ($role, ID: $conn_id): Connection closed by peer."
+            @debug "IO Loop ($role, ID: $conn_id): Connection closed by peer."
         end
     finally
-        @info "IO Loop ($role, ID: $conn_id): Shutting down."
+        @debug "IO Loop ($role, ID: $conn_id): Shutting down."
         close(conn.frame_channel)
     end
 end
 
 function processing_loop_with_client_info(conn::HTTP2Connection, conn_id::String)
     role = conn.role
-    @info "Processing Loop: Starting for Role: $role, ID: $conn_id"
+    @debug "Processing Loop: Starting for Role: $role, ID: $conn_id"
     
     try
         for frame in conn.frame_channel
-            @info "Processing Loop ($role): Dequeued frame -> Type: $(frame))"
+            @debug "Processing Loop ($role): Dequeued frame -> Type: $(frame))"
             process_received_frame(conn, frame)
-            @info "Processing Loop ($role): Finished processing frame."
+            @debug "Processing Loop ($role): Finished processing frame."
             yield()
         end
     catch e
@@ -317,7 +317,7 @@ function processing_loop_with_client_info(conn::HTTP2Connection, conn_id::String
         end
     end
     
-    @info "Processing Loop ($role, ID: $conn_id): Shutting down."
+    @debug "Processing Loop ($role, ID: $conn_id): Shutting down."
 end
 
 function process_received_frame_with_client_info(conn::HTTP2Connection, frame::HTTP2Frame, conn_id::String, client_desc::String)
@@ -342,7 +342,7 @@ Process a received frame and update connection state accordingly.
 function process_received_frame(conn::HTTP2Connection, frame::HTTP2Frame)
     sid = stream_id(frame)
     role = is_client(conn) ? "CLIENT" : "SERVER"
-    @info "[$role][T$(Threads.threadid())] Frame Processing: Starting for frame $(H2Frames.frame_summary(frame))"
+    @debug "[$role][T$(Threads.threadid())] Frame Processing: Starting for frame $(H2Frames.frame_summary(frame))"
     if !consume_token!(conn.rate_limiter)
         @warn "[Conn] Rate limit exceeded for connection $(conn.id). Sending ENHANCE_YOUR_CALM."
         last_stream = get_highest_stream_id(conn)
@@ -354,7 +354,7 @@ function process_received_frame(conn::HTTP2Connection, frame::HTTP2Frame)
     end
     if sid == 0
         process_connection_frame(conn, frame)
-        @info "[$role][T$(Threads.threadid())] Frame Processing: Finished connection-level frame."
+        @debug "[$role][T$(Threads.threadid())] Frame Processing: Finished connection-level frame."
         return
     end
 
@@ -379,7 +379,7 @@ function process_received_frame(conn::HTTP2Connection, frame::HTTP2Frame)
             @error "[$role][T$(Threads.threadid())] Protocol Error: Received invalid frame for new stream $sid. Expected HEADERS or PRIORITY."
             throw(ProtocolError("Invalid frame type for new stream"))
         end
-        @info "[$role][T$(Threads.threadid())] Frame Processing: Creating new stream $sid."
+        @debug "[$role][T$(Threads.threadid())] Frame Processing: Creating new stream $sid."
         stream = HTTP2Stream(sid, conn)
         add_stream(conn, stream)
         Streams.register_stream!(conn.multiplexer, stream)
@@ -388,71 +388,71 @@ function process_received_frame(conn::HTTP2Connection, frame::HTTP2Frame)
     try
         if frame isa HeadersFrame
             if !frame.end_headers
-                @info "[$role][T$(Threads.threadid())] ┣━ Buffering HEADERS fragment for stream $sid..."
+                @debug "[$role][T$(Threads.threadid())] ┣━ Buffering HEADERS fragment for stream $sid..."
                 empty!(conn.header_buffer)
                 write(conn.header_buffer, frame.header_block_fragment)
                 conn.continuation_stream_id = sid
                 conn.continuation_end_stream = frame.end_stream # Αποθηκεύουμε το flag
             else
-                @info "[$role][T$(Threads.threadid())] ┣━ DECODING headers for stream $sid..."
+                @debug "[$role][T$(Threads.threadid())] ┣━ DECODING headers for stream $sid..."
                 local decoded_headers
                 decoded_headers = HPACK.decode_headers(conn.hpack_decoder, frame.header_block_fragment)
-                @info "decode_headers: $(decoded_headers)"
-                @info "[$role][T$(Threads.threadid())] ┣━ CALLING receive_headers! for stream $sid..."
+                @debug "decode_headers: $(decoded_headers)"
+                @debug "[$role][T$(Threads.threadid())] ┣━ CALLING receive_headers! for stream $sid..."
                 receive_headers!(stream, decoded_headers; end_stream=frame.end_stream)
-                @info "[$role][T$(Threads.threadid())] ┣━ RETURNED from receive_headers! for stream $sid."
+                @debug "[$role][T$(Threads.threadid())] ┣━ RETURNED from receive_headers! for stream $sid."
 
                 if is_new_stream && is_server(conn) && conn.request_handler !== nothing
-                    @info "[$role][T$(Threads.threadid())] ┗━ Spawning request handler for new stream $sid."
+                    @debug "[$role][T$(Threads.threadid())] ┗━ Spawning request handler for new stream $sid."
                     errormonitor(@async conn.request_handler(conn, stream))
                 end
             end
 
         elseif frame isa DataFrame
-            @info "[$role][T$(Threads.threadid())] ┣━ CALLING receive_data! for stream $sid..."
+            @debug "[$role][T$(Threads.threadid())] ┣━ CALLING receive_data! for stream $sid..."
             receive_data!(stream, frame.data; end_stream=frame.end_stream)
-            @info "[$role][T$(Threads.threadid())] ┗━ RETURNED from receive_data! for stream $sid."
+            @debug "[$role][T$(Threads.threadid())] ┗━ RETURNED from receive_data! for stream $sid."
 
         elseif frame isa ContinuationFrame
             if frame.stream_id != conn.continuation_stream_id
                 throw(ProtocolError("CONTINUATION frame on wrong stream"))
             end
-            @info "[$role][T$(Threads.threadid())] ┣━ Buffering CONTINUATION fragment for stream $sid..."
+            @debug "[$role][T$(Threads.threadid())] ┣━ Buffering CONTINUATION fragment for stream $sid..."
             write(conn.header_buffer, frame.header_block_fragment)
 
             if frame.end_headers
                 full_header_block = take!(conn.header_buffer)
                 conn.continuation_stream_id = 0 # Επαναφορά
 
-                @info "[$role][T$(Threads.threadid())] ┣━ DECODING complete header block for stream $sid..."
+                @debug "[$role][T$(Threads.threadid())] ┣━ DECODING complete header block for stream $sid..."
                 local decoded_headers
                 decoded_headers = HPACK.decode_headers(conn.hpack_decoder, frame.header_block_fragment)
-                @info "[$role][T$(Threads.threadid())] ┣━ CALLING receive_headers! for stream $sid..."
+                @debug "[$role][T$(Threads.threadid())] ┣━ CALLING receive_headers! for stream $sid..."
                 Streams.receive_headers!(stream, decoded_headers; end_stream=conn.continuation_end_stream)
-                @info "[$role][T$(Threads.threadid())] ┗━ RETURNED from receive_headers! for stream $sid."
+                @debug "[$role][T$(Threads.threadid())] ┗━ RETURNED from receive_headers! for stream $sid."
             end
 
         elseif frame isa WindowUpdateFrame
-            @info "[$role][T$(Threads.threadid())] ┣━ Applying WINDOW_UPDATE for stream $sid..."
+            @debug "[$role][T$(Threads.threadid())] ┣━ Applying WINDOW_UPDATE for stream $sid..."
             apply_flow_control_update(frame, conn)
-            @info "[$role][T$(Threads.threadid())] ┗━ Send window for stream $sid updated."
+            @debug "[$role][T$(Threads.threadid())] ┗━ Send window for stream $sid updated."
 
         elseif frame isa RstStreamFrame
-            @info "[$role][T$(Threads.threadid())] ┣━ Processing RST_STREAM for stream $sid..."
+            @debug "[$role][T$(Threads.threadid())] ┣━ Processing RST_STREAM for stream $sid..."
 
             Streams.apply_rst_stream_frame!(conn, frame)
-            @info "[$role][T$(Threads.threadid())] ┗━ Stream $sid has been reset."
+            @debug "[$role][T$(Threads.threadid())] ┗━ Stream $sid has been reset."
 
         elseif frame isa PriorityFrame
-            @info "[$role][T$(Threads.threadid())] ┣━ Applying PRIORITY update for stream $sid..."
+            @debug "[$role][T$(Threads.threadid())] ┣━ Applying PRIORITY update for stream $sid..."
 
             Streams.apply_priority_frame!(conn, frame)
-            @info "[$role][T$(Threads.threadid())] ┗━ Stream $sid priority updated."
+            @debug "[$role][T$(Threads.threadid())] ┗━ Stream $sid priority updated."
         
         elseif frame isa PushPromiseFrame && is_client(conn)
-            @info "[$role][T$(Threads.threadid())] ┣━ Processing PUSH_PROMISE for associated stream $sid..."
+            @debug "[$role][T$(Threads.threadid())] ┣━ Processing PUSH_PROMISE for associated stream $sid..."
             process_push_promise(conn, frame)
-            @info "[$role][T$(Threads.threadid())] ┗━ PUSH_PROMISE for stream $(frame.promised_stream_id) processed."
+            @debug "[$role][T$(Threads.threadid())] ┗━ PUSH_PROMISE for stream $(frame.promised_stream_id) processed."
 
         else
             @warn "[$role][T$(Threads.threadid())] Frame Processing: Unhandled or invalid frame type $(typeof(frame)) on stream $sid. Ignoring."
@@ -465,7 +465,7 @@ function process_received_frame(conn::HTTP2Connection, frame::HTTP2Frame)
     end
 end
     
-    @info "[$role][T$(Threads.threadid())] Frame Processing: <<<< FINISHED >>>> for frame on stream $sid."
+    @debug "[$role][T$(Threads.threadid())] Frame Processing: <<<< FINISHED >>>> for frame on stream $sid."
 end
 
 """
@@ -536,7 +536,7 @@ function receive_preface!(conn::HTTP2Connection)
         process_settings_frame(conn, settings_frame)
         
         conn.preface_received = true
-        @info  "[Conn] Peer preface received and processed successfully."
+        @debug  "[Conn] Peer preface received and processed successfully."
         return
 
     catch e
@@ -554,7 +554,7 @@ end
 function process_connection_frame(conn::HTTP2Connection, frame::HTTP2Frame)
     if frame isa SettingsFrame
         if is_ack(frame)
-            @info  "[Conn] Received SETTINGS ACK from peer."
+            @debug  "[Conn] Received SETTINGS ACK from peer."
         else
             process_settings_frame(conn, frame)
             
@@ -563,7 +563,7 @@ function process_connection_frame(conn::HTTP2Connection, frame::HTTP2Frame)
                 @lock conn.lock begin
                     notify(conn.preface_handshake_done)
                 end
-                @info  "[Client] Handshake complete: Received server SETTINGS."
+                @debug  "[Client] Handshake complete: Received server SETTINGS."
             end
         end
         # ----------------------
@@ -596,7 +596,7 @@ This will:
 """
 
 function process_goaway_frame(conn::HTTP2Connection, frame::GoAwayFrame)
-    @info "[Conn] Received GOAWAY" last_stream_id=frame.last_stream_id error_code=Exc.error_code_name(frame.error_code)
+    @debug "[Conn] Received GOAWAY" last_stream_id=frame.last_stream_id error_code=Exc.error_code_name(frame.error_code)
     streams_to_cancel = HTTP2Stream[]
 
     @lock conn.lock begin
@@ -616,7 +616,7 @@ function process_goaway_frame(conn::HTTP2Connection, frame::GoAwayFrame)
     end 
 
     for stream in streams_to_cancel
-        @info "[Conn] Closing stream $(stream.id) due to GOAWAY"
+        @debug "[Conn] Closing stream $(stream.id) due to GOAWAY"
         mux_close_stream!(conn.multiplexer, stream.id, :REFUSED_STREAM)
     end
 end
@@ -633,14 +633,14 @@ If the frame is a PING ACK, processes it as a response to an outstanding PING.
 
 function process_ping_frame(connection::HTTP2Connection, frame::PingFrame)
     if !H2Frames.Ping.is_ping_ack(frame)
-        @info "[Conn] Received PING request, queuing ACK."
+        @debug "[Conn] Received PING request, queuing ACK."
         
         ack_frame = H2Frames.Ping.PingAckFrame(frame)
     
         send_frame_on_stream(connection.multiplexer, UInt32(0), ack_frame)
         
     else
-        @info "[Conn] Received PING ACK."
+        @debug "[Conn] Received PING ACK."
         ping_id = get_ping_data_as_uint64(frame)
         
         entry = @lock connection.lock begin
@@ -651,7 +651,7 @@ function process_ping_frame(connection::HTTP2Connection, frame::PingFrame)
             start_time, response_channel = entry
             if isopen(response_channel)
                 rtt = time() - start_time
-                @info "[Conn] PING RTT calculated: $rtt. Notifying waiting task."
+                @debug "[Conn] PING RTT calculated: $rtt. Notifying waiting task."
                 put!(response_channel, rtt)
             end
         else
@@ -743,15 +743,15 @@ Process a received SETTINGS frame and update connection state.
 
 function process_settings_frame(conn::HTTP2Connection, frame::SettingsFrame)
     if is_ack(frame)
-        @info  "[Conn] Received SETTINGS ACK."
+        @debug  "[Conn] Received SETTINGS ACK."
         return
     end
 
     H2Settings.apply_settings!(conn.remote_settings, frame)
-    @info  "[Conn] Applied peer settings: $(settings_to_string(frame.parameters))"
+    @debug  "[Conn] Applied peer settings: $(settings_to_string(frame.parameters))"
     ack_frame = create_settings_ack()
     send_frame(conn, serialize_payload(ack_frame))
-    @info  "[Conn] Sent SETTINGS ACK."
+    @debug  "[Conn] Sent SETTINGS ACK."
 end
 
 """
@@ -773,7 +773,7 @@ function apply_flow_control_update(frame::WindowUpdateFrame, conn::HTTP2Connecti
             update_send_window!(stream, frame.window_size_increment)
         else
             # Αγνοούμε το WINDOW_UPDATE για κλειστό/ανύπαρκτο stream (εκτός του 0)
-            # @info "Ignoring WINDOW_UPDATE for non-existent stream" stream_id=frame.stream_id
+            # @debug "Ignoring WINDOW_UPDATE for non-existent stream" stream_id=frame.stream_id
         end
     end
 end
@@ -860,7 +860,7 @@ function send_goaway!(conn::HTTP2Connection, last_stream_id::UInt32, error_code:
             return
         end
         
-        @info "Queueing GOAWAY frame" last_stream_id=last_stream_id error_code=error_code debug_message=debug_message
+        @debug "Queueing GOAWAY frame" last_stream_id=last_stream_id error_code=error_code debug_message=debug_message
         
         frame = GoAwayFrame(last_stream_id, Exc.error_code_value(error_code), Vector{UInt8}(debug_message))
         
@@ -1067,7 +1067,7 @@ function transition_state!(conn::AbstractHTTP2Connection, new_state::ConnectionS
         throw(ProtocolError("Invalid connection state transition: $old_state → $new_state"))
     end
     
-    @info "State Transition: $old_state → $new_state"
+    @debug "State Transition: $old_state → $new_state"
     conn.state = new_state
 end
 
