@@ -1,4 +1,3 @@
-
 module H2Server
 
 using Sockets
@@ -16,9 +15,9 @@ end
 """
     serve(handler, host, port; ...)
 
-Ξεκινά έναν στιβαρό HTTP/2 server.
-Δέχεται έναν native H2 handler της μορφής: `f(conn::HTTP2Connection, stream::HTTP2Stream)`.
-Οι αλλαγές εδώ επιτρέπουν την εύκολη παραμετροποίηση του TLS.
+Start a robust HTTP/2 server.
+Accepts a native H2 handler of the form: `f(conn::HTTP2Connection, stream::HTTP2Stream)`.
+These changes allow easy TLS customization.
 """
 function serve(handler, host::AbstractString="0.0.0.0", port::Integer=8080; 
              is_tls=true, cert_file::String, key_file::String, ready_channel=nothing, kwargs...)
@@ -52,8 +51,8 @@ end
 """
     handle_new_connection(sock, settings, handler, ...; kwargs...)
 
-Διαχειρίζεται μια νέα εισερχόμενη σύνδεση, εκτελεί το TLS handshake,
-και ξεκινά το HTTP/2 connection preface.
+Handles a new incoming connection, performs the TLS handshake,
+and starts the HTTP/2 connection preface.
 """
 function handle_new_connection(sock::IO, settings::HTTP2Settings, handler, host::String, port::Int64;
                              is_tls=true, cert_file::String, key_file::String, kwargs...)
@@ -88,6 +87,12 @@ function handle_new_connection(sock::IO, settings::HTTP2Settings, handler, host:
     end
 end
 
+"""
+    push_promise!(conn::HTTP2Connection, original_stream::HTTP2Stream, request_headers::Vector{<:Pair})
+
+Send a HTTP/2 PUSH_PROMISE frame for server push.
+Returns the promised stream if successful, otherwise nothing.
+"""
 function push_promise!(conn::HTTP2Connection, original_stream::HTTP2Stream, request_headers::Vector{<:Pair})
     if !is_open(conn) || !conn.settings.enable_push
         @warn "Cannot send PUSH_PROMISE: Push disabled or connection not open."
@@ -171,4 +176,4 @@ function route(handler_map::Dict{String,HTTP2Handler}, req::HTTP2Request)
     return handle_request(h, req)
 end
 
-end 
+end

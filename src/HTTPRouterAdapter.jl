@@ -7,10 +7,43 @@ using ..Connection, ..Exc
 
 export H2Router
 
+"""
+    H2Router
+
+Adapter type that wraps an `HTTP.Router` for use as an HTTP/2 handler.
+Allows you to use HTTP.jl-style routing and request/response handling with H2.jl connections and streams.
+
+# Example
+```julia
+router = HTTP.Router()
+HTTP.register!(router, "GET", "/", req -> HTTP.Response(200, "Hello"))
+h2_handler = H2Router(router)
+```
+"""
 struct H2Router
     router::HTTP.Router
 end
 
+"""
+    (h2r::H2Router)(conn::HTTP2Connection, stream::HTTP2Stream)
+
+Handle an incoming HTTP/2 stream using the wrapped HTTP.Router.
+
+- Reads headers and body from the stream.
+- Constructs an `HTTP.Request` with the correct method, path, headers, and body.
+- Passes the request to the router and gets an `HTTP.Response`.
+- Sends the response headers and body back on the stream.
+- Handles errors and ensures a 500 response is sent if an exception occurs.
+- Attaches the stream object to the request context as `:stream` for advanced handlers.
+
+# Arguments
+- `conn::HTTP2Connection`: The parent HTTP/2 connection.
+- `stream::HTTP2Stream`: The stream to handle.
+
+# Notes
+- If the stream is closed by the handler, no response is sent.
+- All exceptions are logged and a 500 error is sent if possible.
+"""
 function (h2r::H2Router)(conn::HTTP2Connection, stream::HTTP2Stream)
     @info "H2Router: Handling request on stream $(stream.id)"
     try

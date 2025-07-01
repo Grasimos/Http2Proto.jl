@@ -13,12 +13,36 @@ export
     request,
     close
 
+"""
+    HTTP2Client
+
+A client object for managing an HTTP/2 connection.
+Holds the underlying `HTTP2Connection` and provides methods for sending requests, closing, and pinging the server.
+"""
 mutable struct HTTP2Client
     conn::HTTP2Connection
 end
 
 """
-    connect(host, port; ...) -> HTTP2Client
+    connect(host, port; is_tls=true, timeout=10.0, kwargs...) -> HTTP2Client
+
+Establish a new HTTP/2 client connection to the given `host` and `port`.
+
+Arguments:
+- `host::String`: The server hostname or IP address.
+- `port::Int64`: The server port.
+
+Keyword Arguments:
+- `is_tls::Bool=true`: Use TLS (HTTPS) if true, plain TCP if false.
+- `timeout::Float64=10.0`: Timeout in seconds for the HTTP/2 handshake.
+- `verify_peer::Bool=false`: Whether to verify the server's TLS certificate (default: false for testing).
+- `kwargs...`: Additional keyword arguments passed to the TLS or socket layer.
+
+Returns:
+- `HTTP2Client`: A client object ready to send requests.
+
+Throws:
+- `ErrorException` if the handshake times out or connection fails.
 """
 function connect(host::String, port::Int64; is_tls=true, timeout=10.0, kwargs...)
     local socket::IO
@@ -41,6 +65,18 @@ function connect(host::String, port::Int64; is_tls=true, timeout=10.0, kwargs...
     return HTTP2Client(conn)
 end
 
+"""
+    ensure_connection_ready(conn::HTTP2Connection; timeout=10.0)
+
+Wait until the HTTP/2 connection preface is received, or throw on timeout.
+
+Arguments:
+- `conn::HTTP2Connection`: The connection to check.
+- `timeout::Float64`: Maximum time to wait in seconds.
+
+Throws:
+- `ErrorException` if the handshake does not complete in time.
+"""
 function ensure_connection_ready(conn::HTTP2Connection; timeout=10.0)
     @lock conn.lock begin
         if conn.preface_received
@@ -54,6 +90,27 @@ function ensure_connection_ready(conn::HTTP2Connection; timeout=10.0)
     end
 end
 
+"""
+    request(client::HTTP2Client, method::String, path::String; headers=[], body=nothing) -> HTTP2Response
+
+Send an HTTP/2 request and wait for the response.
+
+Arguments:
+- `client::HTTP2Client`: The client object.
+- `method::String`: HTTP method (e.g. "GET", "POST").
+- `path::String`: The request path (e.g. "/api").
+
+Keyword Arguments:
+- `headers::Vector{Pair{String,String}}=[]`: Additional request headers.
+- `body::Union{Vector{UInt8},Nothing}=nothing`: Optional request body.
+
+Returns:
+- `HTTP2Response`: The server's response, including status, headers, and body.
+
+Throws:
+- `ProtocolError` if the connection is shutting down.
+- `StreamError` if the stream is reset by the peer.
+"""
 function request(client::HTTP2Client, method::String, path::String;
                  headers::Vector{Pair{String,String}} = Pair{String,String}[],
                  body::Union{Vector{UInt8},Nothing} = nothing)
@@ -93,6 +150,12 @@ function request(client::HTTP2Client, method::String, path::String;
     )
 end
 
+"""
+    close(client::HTTP2Client)
+
+Gracefully close the HTTP/2 client connection.
+If the connection is already closed, does nothing.
+"""
 function close(client::HTTP2Client)
     if client.conn.state != CONNECTION_CLOSED
         close_connection!(client.conn)
@@ -102,11 +165,19 @@ end
 """
     ping(client::HTTP2Client; timeout=10.0) -> Float64
 
-Sends a PING frame to the server and waits for the acknowledgment,
-returning the round-trip time (RTT) in seconds.
-Throws an error on timeout.
-"""
+Send a PING frame to the server and wait for the acknowledgment.
+Returns the round-trip time (RTT) in seconds.
 
+Arguments:
+- `client::HTTP2Client`: The client object.
+- `timeout::Float64=10.0`: Timeout in seconds to wait for the PING ACK.
+
+Returns:
+- `Float64`: The measured RTT in seconds.
+
+Throws:
+- `ErrorException` if the connection is not open or the PING times out.
+"""
 function ping(client::HTTP2Client; timeout::Float64=10.0)
     conn = client.conn
     if !is_open(conn)
@@ -145,7 +216,14 @@ end
 """
     build_response(stream::HTTP2Stream) -> HTTP2Response
 
-Build an HTTP2Response object from the stream's state.
+Build an `HTTP2Response` object from the stream's state.
+Waits for headers and body to be available.
+
+Arguments:
+- `stream::HTTP2Stream`: The stream to read from.
+
+Returns:
+- `HTTP2Response`: The constructed response object.
 """
 function build_response(stream::HTTP2Stream)
     headers = wait_for_headers(stream)
@@ -162,10 +240,22 @@ end
 
 """
     build_request(method::String, scheme::String, authority::String, path::String;
-                  headers::Vector{Pair{String, String}} = Pair{String, String}[],
-                  body::Union{Vector{UInt8}, String, Nothing} = nothing) -> HTTP2Request
+                  headers=[], body=nothing) -> HTTP2Request
 
 Construct an HTTP/2 request object with pseudo-headers and user headers.
+
+Arguments:
+- `method::String`: HTTP method (e.g. "GET").
+- `scheme::String`: URI scheme ("http" or "https").
+- `authority::String`: Host and port (e.g. "localhost:8000").
+- `path::String`: Request path (e.g. "/api").
+
+Keyword Arguments:
+- `headers::Vector{Pair{String, String}}=[]`: Additional headers.
+- `body::Union{Vector{UInt8}, String, Nothing}=nothing`: Optional request body.
+
+Returns:
+- `HTTP2Request`: The constructed request object.
 """
 function build_request(method::String, scheme::String, authority::String, path::String;
                        headers::Vector{Pair{String, String}} = Pair{String, String}[],
