@@ -1,7 +1,7 @@
 name = "H2"
 uuid = "398584f8-2490-4402-97df-fb572a84d8e7"
 authors = ["Gerasimos Panou <gerasimos.panou@gmail.com>"]
-version = "0.2.0"
+version = "0.3.0"
 
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"

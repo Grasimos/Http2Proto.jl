@@ -8,6 +8,29 @@ using MbedTLS
 
 const ALPN_PROTOCOLS = ["h2", "http/1.1"]
 
+"""
+    tls_accept(tcp_socket::TCPSocket; cert_file::String, key_file::String, alpn_protocols=ALPN_PROTOCOLS, kwargs...)
+
+Accept a new incoming TCP connection and upgrade it to a TLS connection for HTTP/2 server use.
+
+Arguments:
+- `tcp_socket::TCPSocket`: The accepted TCP socket from the server's listen socket.
+
+Keyword Arguments:
+- `cert_file::String`: Path to the server's certificate file (PEM format).
+- `key_file::String`: Path to the server's private key file (PEM format).
+- `alpn_protocols::Vector{String}`: List of ALPN protocols to advertise (default: `["h2", "http/1.1"]`).
+- `kwargs...`: Additional keyword arguments passed to the MbedTLS configuration.
+
+Returns:
+- `MbedTLS.SSLContext`: A TLS-wrapped socket ready for HTTP/2 communication.
+
+Throws:
+- `ErrorException` if ALPN negotiation fails or the handshake fails.
+
+Notes:
+- The function disables peer verification by default for development/testing. For production, set a stricter `authmode!`.
+"""
 function tls_accept(tcp_socket::TCPSocket;
                     cert_file::String, key_file::String, alpn_protocols=ALPN_PROTOCOLS, kwargs...)
     
@@ -41,6 +64,29 @@ function tls_accept(tcp_socket::TCPSocket;
     return ssl_context
 end
 
+"""
+    tls_connect(host::AbstractString, port::Integer; alpn_protocols=ALPN_PROTOCOLS, verify_peer::Bool=false, kwargs...)
+
+Establish a TLS connection to a remote HTTP/2 server, performing ALPN negotiation.
+
+Arguments:
+- `host::AbstractString`: The server hostname or IP address.
+- `port::Integer`: The server port.
+
+Keyword Arguments:
+- `alpn_protocols::Vector{String}`: List of ALPN protocols to advertise (default: `["h2", "http/1.1"]`).
+- `verify_peer::Bool=false`: Whether to verify the server's certificate (default: false for testing).
+- `kwargs...`: Additional keyword arguments passed to the MbedTLS configuration.
+
+Returns:
+- `MbedTLS.SSLContext`: A TLS-wrapped socket ready for HTTP/2 communication.
+
+Throws:
+- `ErrorException` if ALPN negotiation fails or the handshake fails.
+
+Notes:
+- For production, set `verify_peer=true` and provide CA certificates as needed.
+"""
 function tls_connect(host::AbstractString, port::Integer; alpn_protocols=ALPN_PROTOCOLS, verify_peer::Bool=false, kwargs...)
     @debug "Configuring CLIENT TLS for $host:$port"
     tcp_socket = Sockets.connect(host, port)
@@ -74,4 +120,4 @@ function tls_connect(host::AbstractString, port::Integer; alpn_protocols=ALPN_PR
     return ssl_context
 end
 
-end 
+end

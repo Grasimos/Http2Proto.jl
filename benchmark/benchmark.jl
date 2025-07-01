@@ -32,7 +32,7 @@ function run_benchmark()
         is_tls=false, 
         cert_file=CERT_PATH, 
         key_file=KEY_PATH,
-        max_concurrent_streams=1000000, # <-- ΑΥΞΑΝΟΥΜΕ ΤΟ ΟΡΙΟ ΓΙΑ ΤΟ TEST
+        max_concurrent_streams=1000, # <-- ΑΥΞΑΝΟΥΜΕ ΤΟ ΟΡΙΟ ΓΙΑ ΤΟ TEST
         ready_channel=startup_channel
     ))
     
