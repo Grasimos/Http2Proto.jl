@@ -44,7 +44,7 @@ Returns:
 Throws:
 - `ErrorException` if the handshake times out or connection fails.
 """
-function connect(host::String, port::Int64; is_tls=true, timeout=10.0, kwargs...)
+function connect(host::String, port::Int64; is_tls=true, timeout=10.0, settings::Union{HTTP2Settings, Nothing}=nothing, kwargs...)
     local socket::IO
     
     if is_tls
@@ -53,10 +53,11 @@ function connect(host::String, port::Int64; is_tls=true, timeout=10.0, kwargs...
         socket = Sockets.connect(host, port)
     end
     
-    settings = H2Settings.create_client_settings()
+    client_settings = (settings === nothing) ? H2Settings.create_client_settings() : settings
+
     @info "Client: Connecting to $host:$port (TLS: $is_tls)"
     
-    conn = HTTP2Connection(socket, CLIENT, settings, host, port)
+    conn = HTTP2Connection(socket, CLIENT, client_settings, host, port)
     
     Connection.start_connection_loops!(conn)
     send_preface!(conn)
@@ -78,16 +79,21 @@ Throws:
 - `ErrorException` if the handshake does not complete in time.
 """
 function ensure_connection_ready(conn::HTTP2Connection; timeout=10.0)
-    @lock conn.lock begin
-        if conn.preface_received
-            return
+    start_time = time()
+    while (time() - start_time) < timeout
+        @lock conn.state_lock begin
+            # Check if the preface has been received
+            if conn.preface_received
+                return # Success!
+            end
         end
-        status = timedwait(() -> conn.preface_received, timeout)
-        if status == :timeout
-            close_connection!(conn, :PROTOCOL_ERROR, "Handshake timeout")
-            throw(ErrorException("HTTP/2 connection handshake timeout after $(timeout)s"))
-        end
+        # Don't hold the lock while sleeping
+        sleep(0.01)
     end
+    
+    # If the loop finishes, we have timed out
+    close_connection!(conn, :PROTOCOL_ERROR, "Handshake timeout")
+    throw(ErrorException("HTTP/2 connection handshake timeout after $(timeout)s"))
 end
 
 """
@@ -116,7 +122,7 @@ function request(client::HTTP2Client, method::String, path::String;
                  body::Union{Vector{UInt8},Nothing} = nothing)
     conn = client.conn
 
-    @lock conn.lock begin
+    @lock conn.state_lock begin
         if conn.goaway_received
             throw(ProtocolError("Cannot send new request; GOAWAY received from peer."))
         end
@@ -187,7 +193,7 @@ function ping(client::HTTP2Client; timeout::Float64=10.0)
     ping_id = rand(UInt64)
     response_channel = Channel{Float64}(1)
 
-    @lock conn.lock begin
+    @lock conn.pings_lock begin
         conn.pending_pings[ping_id] = (time(), response_channel)
     end
 
@@ -198,7 +204,7 @@ function ping(client::HTTP2Client; timeout::Float64=10.0)
     status = timedwait(() -> isready(response_channel), timeout)
 
     if status == :timeout
-        @lock conn.lock begin
+        @lock conn.pings_lock begin
             pop!(conn.pending_pings, ping_id, nothing)
         end
         throw(ErrorException("PING timed out after $timeout seconds."))
@@ -206,7 +212,7 @@ function ping(client::HTTP2Client; timeout::Float64=10.0)
 
     rtt = take!(response_channel)
     
-    @lock conn.lock begin
+    @lock conn.pings_lock begin
         pop!(conn.pending_pings, ping_id, nothing)
     end
 

@@ -4,6 +4,8 @@ using Sockets
 using ..H2Types: ConnectionRole, SERVER, HTTP2Connection, HTTP2Stream, HTTP2Request, is_server, is_client
 using ..H2Types
 using ..Exc, ..Connection, ..Streams, ..H2Settings, ..H2TLSIntegration 
+using HPACK
+using H2Frames
 export HTTP2Server, serve, push_promise!
 
 mutable struct HTTP2Server
@@ -20,7 +22,7 @@ Accepts a native H2 handler of the form: `f(conn::HTTP2Connection, stream::HTTP2
 These changes allow easy TLS customization.
 """
 function serve(handler, host::AbstractString="0.0.0.0", port::Integer=8080; 
-             is_tls=true, cert_file::String, key_file::String, ready_channel=nothing, kwargs...)
+             is_tls=true, cert_file::String, key_file::String, ready_channel=nothing, settings::Union{HTTP2Settings, Nothing}=nothing, kwargs...)
 
     server_socket = listen(Sockets.getaddrinfo(host), port)
     
@@ -28,7 +30,8 @@ function serve(handler, host::AbstractString="0.0.0.0", port::Integer=8080;
         put!(ready_channel, true)
     end
 
-    server_settings = create_server_settings()
+    server_settings = (settings === nothing) ? create_server_settings() : settings # <-- Use settings
+
     @info "H2 Server listening on $host:$port (TLS: $is_tls)..."
     
     try
@@ -94,15 +97,17 @@ Send a HTTP/2 PUSH_PROMISE frame for server push.
 Returns the promised stream if successful, otherwise nothing.
 """
 function push_promise!(conn::HTTP2Connection, original_stream::HTTP2Stream, request_headers::Vector{<:Pair})
-    if !is_open(conn) || !conn.settings.enable_push
-        @warn "Cannot send PUSH_PROMISE: Push disabled or connection not open."
-        return
+    if !is_open(conn) || !conn.remote_settings.enable_push
+        @warn "Cannot send PUSH_PROMISE: Push disabled by client or connection not open."
+        return nothing
     end
 
     local promised_stream
-    @lock conn.lock begin
-    try
-        if length(conn.streams) >= conn.settings.max_concurrent_streams
+    local push_promise_frame
+
+    # Step 1: Lock *only* to modify the shared stream state
+    @lock conn.streams_lock begin
+        if length(conn.streams) >= conn.remote_settings.max_concurrent_streams
             @warn "Cannot send PUSH_PROMISE: Max concurrent streams reached."
             return nothing
         end
@@ -112,24 +117,23 @@ function push_promise!(conn::HTTP2Connection, original_stream::HTTP2Stream, requ
         
         promised_stream = HTTP2Stream(promised_stream_id, conn)
         add_stream(conn, promised_stream)
-        Streams.StreamStateMachine.transition_stream_state!(promised_stream, :send_push_promise)
+        register_stream!(conn.multiplexer, promised_stream)
+        transition_stream_state!(promised_stream, :send_push_promise)
 
         header_block = HPACK.encode_headers(conn.hpack_encoder, request_headers)
         
-        push_promise_frame = Frames.PushPromiseFrame(
+        push_promise_frame = H2Frames.PushPromiseFrame(
             original_stream.id,
             promised_stream.id,
             header_block
         )
-    
-        @info "[PushPromise] Sending PUSH_PROMISE frame directly for stream $(promised_stream.id)."
-        StateMachine.send_frame(conn, serialize_frame(push_promise_frame))
+    end # End of lock
 
-        catch e
-                @info "$e"
-        end
-    end
-    @info "[PushPromise] Successfully created and sent PUSH_PROMISE for stream $(promised_stream.id)."
+    # Step 2: Perform the network I/O *outside* the state lock
+    @info "[PushPromise] Sending PUSH_PROMISE frame for stream $(promised_stream.id)."
+    Connection.send_frame(conn, serialize_frame(push_promise_frame))
+    @info "[PushPromise] Successfully sent PUSH_PROMISE for stream $(promised_stream.id)."
+    
     return promised_stream
 end
 
