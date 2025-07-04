@@ -462,72 +462,70 @@ end
 """
     transition_stream_state!(stream::HTTP2Stream, event::Symbol)
 
-Transition the stream state according to RFC 7540 §5.1.
-The event can be:
-- :send_headers, :recv_headers
-- :send_push_promise, :recv_push_promise
-- :send_data, :recv_data
-- :send_rst_stream, :recv_rst_stream
-- :send_end_stream, :recv_end_stream
+Transitions the stream state according to RFC 7540 §5.1 by dispatching
+to a helper function based on the current state and the event.
 """
 function transition_stream_state!(stream::HTTP2Stream, event::Symbol)
-    state = stream.state
-    new_state = nothing
+    old_state = stream.state
+    new_state = _get_next_state(Val(old_state), Val(event))
 
-    if state == STREAM_IDLE
-        if event == :send_headers || event == :recv_headers
-            new_state = STREAM_OPEN
-        elseif event == :send_push_promise
-            new_state = STREAM_RESERVED_LOCAL
-        elseif event == :recv_push_promise
-            new_state = STREAM_RESERVED_REMOTE
-        end
-    elseif state == STREAM_RESERVED_LOCAL
-        if event == :send_headers
-            new_state = STREAM_HALF_CLOSED_REMOTE
-        elseif event == :recv_rst_stream
-            new_state = STREAM_CLOSED
-        end
-    elseif state == STREAM_RESERVED_REMOTE
-        if event == :send_headers
-            new_state = STREAM_HALF_CLOSED_LOCAL
-        elseif event == :recv_rst_stream
-            new_state = STREAM_CLOSED
-        end
-    elseif state == STREAM_OPEN
-        if event == :send_data || event == :recv_data || event == :send_headers || event == :recv_headers
-            return
-        elseif event == :send_end_stream
-            new_state = STREAM_HALF_CLOSED_LOCAL
-        elseif event == :recv_end_stream
-            new_state = STREAM_HALF_CLOSED_REMOTE
-        elseif event == :send_rst_stream || event == :recv_rst_stream
-            new_state = STREAM_CLOSED
-        end
-    elseif state == STREAM_HALF_CLOSED_LOCAL
-        if event == :recv_data || event == :recv_headers
-            return
-        elseif event == :recv_end_stream
-            new_state = STREAM_CLOSED
-        elseif event == :send_rst_stream || event == :recv_rst_stream
-            new_state = STREAM_CLOSED
-        end
-    elseif state == STREAM_HALF_CLOSED_REMOTE
-        if event == :send_data || event == :send_headers
-            return
-        elseif event == :send_end_stream
-            new_state = STREAM_CLOSED
-        elseif event == :send_rst_stream || event == :recv_rst_stream
-            new_state = STREAM_CLOSED
-        end
-    end
-
-    if new_state !== nothing
+    if new_state !== nothing && new_state != old_state
         stream.state = new_state
-    else
-        throw(Exc.ProtocolError("Invalid stream state transition: $state + $event"))
+        @debug "Stream $(stream.id) state transition: $old_state -> $new_state (on :$event)"
     end
 end
+
+# --- State Machine Helper Functions ---
+function _get_next_state(from::Val{S}, on::Val{E}) where {S, E}
+    throw(Exc.ProtocolError("Invalid stream state transition from $S on event $E"))
+end
+
+# --- Transitions from 'idle' state ---
+_get_next_state(::Val{STREAM_IDLE}, ::Val{:send_headers}) = STREAM_OPEN
+_get_next_state(::Val{STREAM_IDLE}, ::Val{:recv_headers}) = STREAM_OPEN
+_get_next_state(::Val{STREAM_IDLE}, ::Val{:send_push_promise}) = STREAM_RESERVED_LOCAL 
+_get_next_state(::Val{STREAM_IDLE}, ::Val{:recv_push_promise}) = STREAM_RESERVED_REMOTE 
+
+# --- Transitions from 'reserved_local' state ---
+_get_next_state(::Val{STREAM_RESERVED_LOCAL}, ::Val{:send_headers}) = STREAM_HALF_CLOSED_REMOTE 
+_get_next_state(::Val{STREAM_RESERVED_LOCAL}, ::Val{:send_rst_stream}) = STREAM_CLOSED
+_get_next_state(::Val{STREAM_RESERVED_LOCAL}, ::Val{:recv_rst_stream}) = STREAM_CLOSED
+
+# --- Transitions from 'reserved_remote' state ---
+_get_next_state(::Val{STREAM_RESERVED_REMOTE}, ::Val{:recv_headers}) = STREAM_HALF_CLOSED_LOCAL
+_get_next_state(::Val{STREAM_RESERVED_REMOTE}, ::Val{:send_rst_stream}) = STREAM_CLOSED
+_get_next_state(::Val{STREAM_RESERVED_REMOTE}, ::Val{:recv_rst_stream}) = STREAM_CLOSED 
+
+# --- Transitions from 'open' state ---
+_get_next_state(::Val{STREAM_OPEN}, ::Val{:send_end_stream}) = STREAM_HALF_CLOSED_LOCAL 
+_get_next_state(::Val{STREAM_OPEN}, ::Val{:recv_end_stream}) = STREAM_HALF_CLOSED_REMOTE 
+_get_next_state(::Val{STREAM_OPEN}, ::Val{:send_rst_stream}) = STREAM_CLOSED 
+_get_next_state(::Val{STREAM_OPEN}, ::Val{:recv_rst_stream}) = STREAM_CLOSED
+# No-op transitions (valid but do not change state)
+_get_next_state(::Val{STREAM_OPEN}, ::Val{:send_data}) = nothing
+_get_next_state(::Val{STREAM_OPEN}, ::Val{:recv_data}) = nothing
+_get_next_state(::Val{STREAM_OPEN}, ::Val{:send_headers}) = nothing
+_get_next_state(::Val{STREAM_OPEN}, ::Val{:recv_headers}) = nothing
+
+
+# --- Transitions from 'half_closed_local' state ---
+_get_next_state(::Val{STREAM_HALF_CLOSED_LOCAL}, ::Val{:recv_end_stream}) = STREAM_CLOSED 
+_get_next_state(::Val{STREAM_HALF_CLOSED_LOCAL}, ::Val{:send_rst_stream}) = STREAM_CLOSED 
+_get_next_state(::Val{STREAM_HALF_CLOSED_LOCAL}, ::Val{:recv_rst_stream}) = STREAM_CLOSED 
+# No-op transitions
+_get_next_state(::Val{STREAM_HALF_CLOSED_LOCAL}, ::Val{:recv_data}) = nothing 
+_get_next_state(::Val{STREAM_HALF_CLOSED_LOCAL}, ::Val{:recv_headers}) = nothing 
+
+# --- Transitions from 'half_closed_remote' state ---
+_get_next_state(::Val{STREAM_HALF_CLOSED_REMOTE}, ::Val{:send_end_stream}) = STREAM_CLOSED 
+_get_next_state(::Val{STREAM_HALF_CLOSED_REMOTE}, ::Val{:send_rst_stream}) = STREAM_CLOSED 
+_get_next_state(::Val{STREAM_HALF_CLOSED_REMOTE}, ::Val{:recv_rst_stream}) = STREAM_CLOSED 
+# No-op transitions
+_get_next_state(::Val{STREAM_HALF_CLOSED_REMOTE}, ::Val{:send_data}) = nothing 
+_get_next_state(::Val{STREAM_HALF_CLOSED_REMOTE}, ::Val{:send_headers}) = nothing 
+
+# --- Final 'closed' state ---
+_get_next_state(::Val{STREAM_CLOSED}, ::Val{:any_late_frame_event}) = nothing
 
 # =============================================================================
 # STATE QUERY FUNCTIONS

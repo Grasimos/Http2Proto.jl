@@ -83,8 +83,8 @@ using H2
     
     startup_channel = Channel{Bool}(1)
     
-    CERT_PATH = get(ENV, "CERT_PATH", joinpath(@__DIR__, "../cert.pem"))
-    KEY_PATH = get(ENV, "KEY_PATH", joinpath(@__DIR__, "../key.pem"))
+    CERT_PATH = get(ENV, "CERT_PATH", joinpath(homedir(), ".mbedtls", "cert.pem"))
+    KEY_PATH = get(ENV, "KEY_PATH", joinpath(homedir(), ".mbedtls", "key.pem"))
 
     server_task = errormonitor(@async H2.serve(
         h2_handler, 
