@@ -167,7 +167,7 @@ function send_frame_on_stream(mux::StreamMultiplexer, stream_id::UInt32, frame::
         channel = get(mux.frame_channels, stream_id, nothing)
         if channel === nothing || !isopen(channel)
             @warn "[$role][T$(threadid())] Cannot send frame on closed/missing stream $stream_id"
-            throw(StreamError(UInt32(STREAM_CLOSED), "Cannot send frame on closed stream $stream_id", stream_id))
+            throw(StreamError(:STREAM_CLOSED_ERROR, "Cannot send frame on closed stream $stream_id", stream_id))
         end
         
         put!(channel, frame)
@@ -263,7 +263,7 @@ function wait_for_headers(stream::HTTP2Stream)
     role = is_client(stream.connection) ? "CLIENT" : "SERVER"
     @debug "[$role][T$(threadid())] Stream $(stream.id): Called wait_for_headers, acquiring lock..."
     
-    @lock stream.connection.lock begin
+    @lock stream.lock begin
         @debug "[$role][T$(threadid())] Stream $(stream.id): Acquired lock for wait_for_headers"
         
         while isempty(stream.headers) && !stream.end_stream_received && is_active(stream)
@@ -288,7 +288,7 @@ function wait_for_body(stream::HTTP2Stream)
     @debug "[$role][T$(threadid())] Stream $(stream.id): Called wait_for_body, acquiring lock..."
     local read_data
 
-    @lock stream.connection.lock begin
+    @lock stream.lock begin
         @debug "[$role][T$(threadid())] Stream $(stream.id): Acquired lock for wait_for_body"
         
         while bytesavailable(stream.data_buffer) == 0 && !stream.end_stream_received && is_active(stream)
@@ -427,27 +427,26 @@ Updates the stream's priority, dependency tree, and multiplexer priority queue.
 function apply_priority_frame!(conn::HTTP2Connection, frame::PriorityFrame)
     @debug "Applying PRIORITY frame for stream $(frame.stream_id)"
     
-    @lock conn.lock begin
-        stream = get_stream(conn, frame.stream_id)
-        if stream === nothing
-            @debug "Received PRIORITY for idle/unknown stream $(frame.stream_id), ignoring"
-            return
-        end
+    # The conn.streams_lock is already held by the calling function.
+    # We only need to lock the multiplexer to update its queue.
+    stream = get_stream(conn, frame.stream_id)
+    if stream === nothing
+        @debug "Received PRIORITY for idle/unknown stream $(frame.stream_id), ignoring"
+        return
+    end
 
-        new_weight = H2Frames.Priority.actual_weight(frame)
-        old_weight = stream.priority.weight
-        stream.priority = StreamPriority(frame.exclusive, frame.stream_dependency, new_weight)
-        
-        @debug "Updated stream $(frame.stream_id) priority: weight $old_weight → $new_weight, dependency=$(frame.stream_dependency), exclusive=$(frame.exclusive)"
-        
-        update_stream_dependency!(
-            conn.streams,
-            frame.stream_id,
-            frame.stream_dependency,
-            frame.exclusive
-        )
-        
-        mux = conn.multiplexer
+    new_weight = H2Frames.Priority.actual_weight(frame)
+    stream.priority = StreamPriority(frame.exclusive, frame.stream_dependency, new_weight)
+    
+    update_stream_dependency!(
+        conn.streams,
+        frame.stream_id,
+        frame.stream_dependency,
+        frame.exclusive
+    )
+    
+    mux = conn.multiplexer
+    @lock mux.send_lock begin
         if haskey(mux.pending_streams, stream.id)
             mux.pending_streams[stream.id] = new_weight
             @debug "Updated priority for stream $(stream.id) in pending queue to $new_weight"

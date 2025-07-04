@@ -88,17 +88,22 @@ function send_headers!(stream::HTTP2Stream, headers::Vector{<:Pair{<:AbstractStr
     @debug "[$role][T$(threadid())] Stream $(stream.id): Queueing HEADERS" headers=headers end_stream=end_stream
 
     final_headers = [lowercase(String(k)) => String(v) for (k, v) in headers]
-    @lock stream.connection.lock begin
+
+    # Lock the stream only to perform the state transition
+    @lock stream.lock begin
         transition_stream_state!(stream, :send_headers)
         if end_stream
             transition_stream_state!(stream, :send_end_stream)
         end
-    
+    end
+
+    # HPACK encoding can happen outside the lock. The send_loop will serialize it.
     header_block = HPACK.encode_headers(stream.connection.hpack_encoder, final_headers)
     frame = HeadersFrame(stream.id, header_block; end_stream=end_stream)
 
-    send_frame(stream.connection, serialize_frame(frame))
-    end
+    # Correctly queue the frame for the multiplexer's send_loop
+    send_frame_on_stream(stream.connection.multiplexer, stream.id, frame)
+    
     @debug "[$role][T$(threadid())] Stream $(stream.id): HEADERS frame queued."
 end
 
@@ -106,30 +111,34 @@ function send_data!(stream::HTTP2Stream, data::Vector{UInt8}; end_stream::Bool=f
     role = is_client(stream.connection) ? "CLIENT" : "SERVER"
     @debug "[$role][T$(threadid())] Stream $(stream.id): Queueing DATA" bytes=length(data) end_stream=end_stream
 
-    transition_stream_state!(stream, :send_data)
+    # Lock the stream only to perform the state transition
+    @lock stream.lock begin
+        transition_stream_state!(stream, :send_data)
+    end
     
     max_frame_size = Int(stream.connection.remote_settings.max_frame_size)
-
     frames_to_send = create_data_frame(stream.id, data; end_stream=false, max_frame_size=max_frame_size)
-    @lock stream.connection.lock begin
+
     if isempty(frames_to_send) && end_stream
         empty_frame = DataFrame(stream.id, UInt8[]; end_stream=true)
         send_frame_on_stream(stream.connection.multiplexer, stream.id, empty_frame)
     else
+        # Queue each DATA frame for the send_loop
         for (i, frame) in enumerate(frames_to_send)
             is_last_frame = (i == length(frames_to_send))
-            
             final_end_stream = is_last_frame && end_stream
             
             final_frame = DataFrame(frame.stream_id, frame.data; end_stream=final_end_stream)
-            send_frame(stream.connection, serialize_frame(final_frame))
+            send_frame_on_stream(stream.connection.multiplexer, stream.id, final_frame)
         end
     end
 
     if end_stream
-        transition_stream_state!(stream, :send_end_stream)
+        # Lock the stream again only for the final state transition
+        @lock stream.lock begin
+            transition_stream_state!(stream, :send_end_stream)
+        end
     end
-end
 end
 
 
@@ -137,7 +146,7 @@ function receive_headers!(stream::HTTP2Stream, headers::Vector{<:Pair{<:Abstract
     role = is_client(stream.connection) ? "CLIENT" : "SERVER"
     @debug "[$role][T$(threadid())] Stream $(stream.id): Receiving HEADERS, acquiring lock..."
     
-    @lock stream.connection.lock begin
+    @lock stream.lock begin
         @debug "[$role][T$(threadid())] Stream $(stream.id): Acquired lock. Setting headers."
         stream.headers = headers
         transition_stream_state!(stream, :recv_headers)
@@ -164,7 +173,7 @@ function receive_data!(stream::HTTP2Stream, data::Vector{UInt8}; end_stream::Boo
     
     consume_receive_window!(stream, length(data))
 
-    @lock stream.connection.lock begin
+    @lock stream.lock begin
         write(stream.data_buffer, data)
         transition_stream_state!(stream, :recv_data)
         if end_stream
@@ -185,7 +194,7 @@ Get the next available stream ID for this connection.
 Clients use odd numbers (1, 3, 5, ...), servers use even numbers (2, 4, 6, ...).
 """
 function next_stream_id(conn::HTTP2Connection)
-    @lock conn.lock begin
+    @lock conn.streams_lock begin
         current = conn.last_stream_id
         conn.last_stream_id += 2  # Skip by 2 to maintain odd/even pattern
         return current
@@ -198,7 +207,7 @@ end
 Add a stream to the connection's stream table.
 """
 function add_stream(conn::HTTP2Connection, stream::HTTP2Stream)
-    @lock conn.lock begin
+    @lock conn.streams_lock begin
         conn.streams[stream.id] = stream
         
         if (is_client(conn) && iseven(stream.id)) || (is_server(conn) && isodd(stream.id))
@@ -213,7 +222,7 @@ end
 Get a stream by its ID, or nothing if it doesn't exist.
 """
 function get_stream(conn::HTTP2Connection, stream_id::UInt32)
-    @lock conn.lock begin
+    @lock conn.streams_lock begin
         return get(conn.streams, stream_id, nothing)
     end
 end
@@ -224,7 +233,7 @@ end
 Remove a stream from the connection's stream table.
 """
 function remove_stream(conn::HTTP2Connection, stream_id::UInt32)
-    @lock conn.lock begin
+    @lock conn.streams_lock begin
         delete!(conn.streams, stream_id)
     end
 end
@@ -232,7 +241,7 @@ end
 
 
 function create_client_stream!(conn::HTTP2Connection)
-    @lock conn.lock begin
+    @lock conn.streams_lock begin
         # Έλεγχος αν μπορούμε να δημιουργήσουμε νέο stream
         if length(conn.streams) >= conn.remote_settings.max_concurrent_streams
             throw(StreamLimitError("Cannot create new stream, remote limit reached"))
@@ -351,7 +360,7 @@ function process_received_frame(conn::HTTP2Connection, frame::HTTP2Frame)
     if !consume_token!(conn.rate_limiter)
         @warn "[Conn] Rate limit exceeded for connection $(conn.id). Sending ENHANCE_YOUR_CALM." 
         last_stream = get_highest_stream_id(conn)
-        @lock conn.lock begin
+        @lock conn.state_lock begin
             send_goaway!(conn, last_stream, :ENHANCE_YOUR_CALM, "Rate limit exceeded")
         end
         close_connection!(conn, :ENHANCE_YOUR_CALM, "Rate limit exceeded") 
@@ -391,7 +400,7 @@ function process_received_frame(conn::HTTP2Connection, frame::HTTP2Frame)
     end
 
     # 5. Lock and Dispatch to the appropriate stream_frame handler
-    @lock conn.lock begin
+    @lock conn.streams_lock begin
         try
             # The magic of multiple dispatch happens here!
             process_stream_frame(conn, stream, frame)
@@ -424,7 +433,7 @@ function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame:
     role = is_client(conn) ? "CLIENT" : "SERVER"
     if !frame.end_headers
         @debug "[$role][T$(Threads.threadid())] ┣━ Buffering HEADERS fragment for stream $(stream.id)..."
-        empty!(conn.header_buffer)
+        truncate(conn.header_buffer, 0)
         write(conn.header_buffer, frame.header_block_fragment)
         conn.continuation_stream_id = stream.id
         conn.continuation_end_stream = frame.end_stream 
@@ -454,21 +463,33 @@ Processes a CONTINUATION frame.
 function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame::ContinuationFrame)
     role = is_client(conn) ? "CLIENT" : "SERVER"
     if frame.stream_id != conn.continuation_stream_id
-        throw(ProtocolError("CONTINUATION frame on wrong stream")) 
+        throw(ProtocolError("CONTINUATION frame on wrong stream"))
     end
     @debug "[$role][T$(Threads.threadid())] ┣━ Buffering CONTINUATION fragment for stream $(stream.id)..."
     write(conn.header_buffer, frame.header_block_fragment)
 
-    if frame.end_headers
+   if frame.end_headers
         full_header_block = take!(conn.header_buffer)
-        conn.continuation_stream_id = 0 
+        promised_id = conn.pending_push_promise_id
+        continuation_end_stream_flag = conn.continuation_end_stream
+        conn.continuation_stream_id = 0
+        conn.pending_push_promise_id = 0
 
-        @debug "[$role][T$(Threads.threadid())] ┣━ DECODING complete header block for stream $(stream.id)..."
-        local decoded_headers
-        decoded_headers = HPACK.decode_headers(conn.hpack_decoder, full_header_block) # Note: Use full_header_block here
-        @debug "[$role][T$(Threads.threadid())] ┣━ CALLING receive_headers! for stream $(stream.id)..."
-        receive_headers!(stream, decoded_headers; end_stream=conn.continuation_end_stream) 
-        @debug "[$role][T$(Threads.threadid())] ┗━ RETURNED from receive_headers! for stream $(stream.id)." 
+        decoded_headers = HPACK.decode_headers(conn.hpack_decoder, full_header_block)
+
+        # NEW LOGIC: Was this a PUSH_PROMISE continuation?
+        if promised_id != 0
+            # Yes. Find the PROMISED stream and assign its headers.
+            promised_stream = get_stream(conn, promised_id)
+            if promised_stream !== nothing
+                promised_stream.headers = decoded_headers
+                @debug "[CLIENT] Finished PUSH_PROMISE continuation for stream $(promised_id)."
+            end
+        else
+            # No, it was a regular HEADERS continuation.
+            # 'stream' is the correct target for the response headers.
+            receive_headers!(stream, decoded_headers; end_stream=continuation_end_stream_flag)
+        end
     end
 end
 
@@ -529,7 +550,7 @@ For servers, this is just a SETTINGS frame.
 """
 
 function send_preface!(conn::HTTP2Connection)
-    @lock conn.lock begin
+    @lock conn.state_lock begin
         if conn.preface_sent || conn.state != CONNECTION_IDLE
             return
         end
@@ -617,15 +638,21 @@ Processes a connection-level SETTINGS frame.
 """
 function process_connection_frame(conn::HTTP2Connection, frame::SettingsFrame)
     if is_ack(frame)
-        @debug "[Conn] Received SETTINGS ACK from peer." 
+        @debug  "[Conn] Received SETTINGS ACK from peer."
     else
-        process_settings_frame(conn, frame)  # Assumes process_settings_frame remains the worker
-        if is_client(conn) && !conn.preface_received
-            conn.preface_received = true 
-            @lock conn.lock begin
-                notify(conn.preface_handshake_done)
+        process_settings_frame(conn, frame)
+            
+        if is_client(conn)
+            # Atomically check and set the preface flag under the state_lock
+            @lock conn.state_lock begin
+                if !conn.preface_received
+                    conn.preface_received = true
+                    # The notify is for more advanced waiting patterns,
+                    # but it's good to keep it here under the correct lock.
+                    notify(conn.preface_handshake_done)
+                end
             end
-            @debug "[Client] Handshake complete: Received server SETTINGS." 
+            @debug "[Client] Handshake complete: Received server SETTINGS."
         end
     end
 end
@@ -675,7 +702,7 @@ function process_goaway_frame(conn::HTTP2Connection, frame::GoAwayFrame)
     @debug "[Conn] Received GOAWAY" last_stream_id=frame.last_stream_id error_code=Exc.error_code_name(frame.error_code)
     streams_to_cancel = HTTP2Stream[]
 
-    @lock conn.lock begin
+    @lock conn.state_lock begin
         if conn.goaway_received
             return
         end
@@ -719,7 +746,7 @@ function process_ping_frame(connection::HTTP2Connection, frame::PingFrame)
         @debug "[Conn] Received PING ACK."
         ping_id = get_ping_data_as_uint64(frame)
         
-        entry = @lock connection.lock begin
+        entry = @lock connection.pings_lock begin
             pop!(connection.pending_pings, ping_id, nothing)
         end
 
@@ -756,27 +783,42 @@ Handles a received PUSH_PROMISE frame.
 function process_push_promise(conn::HTTP2Connection, frame::PushPromiseFrame)
     original_stream = get_stream(conn, frame.stream_id)
     if original_stream === nothing || !is_active(original_stream)
+        @warn "Received PUSH_PROMISE on a non-existent or inactive stream $(frame.stream_id). Ignoring."
         return
     end
 
+    # Step 1: ALWAYS create and register the promised stream locally first.
+    promised_stream = HTTP2Stream(frame.promised_stream_id, conn)
+    add_stream(conn, promised_stream)
+    Streams.register_stream!(conn.multiplexer, promised_stream)
+    transition_stream_state!(promised_stream, :recv_push_promise)
+
+    # Step 2: Decide whether to keep or reject the stream.
     if !conn.settings.enable_push
-        rst = RstStreamFrame(frame.promised_stream_id, REFUSED_STREAM)
+        @debug "[CLIENT] Push is disabled. Rejecting promised stream $(frame.promised_stream_id)."
+        error_val = Exc.error_code_value(REFUSED_STREAM)
+        rst = RstStreamFrame(frame.promised_stream_id, error_val)
         send_frame_on_stream(conn.multiplexer, frame.promised_stream_id, rst)
         return
     end
 
-    promised_stream = HTTP2Stream(frame.promised_stream_id, conn)
-    add_stream(conn, promised_stream)
-    Streams.register_stream!(conn.multiplexer, promised_stream)
-
-    Streams.StreamStateMachine.transition_stream_state!(promised_stream, :recv_push_promise)
-
+    # Step 3: Handle the header block, now with CONTINUATION support.
     if !frame.end_headers
-        # TODO: Χειρισμός CONTINUATION για PUSH_PROMISE
+        # The header block is fragmented. Start the continuation sequence.
+        @debug "[CLIENT] Buffering PUSH_PROMISE fragment for promised stream $(frame.promised_stream_id)..."
+        truncate(conn.header_buffer, 0)
+        write(conn.header_buffer, frame.header_block_fragment)
+        
+        # Track the stream whose headers are being continued (the original stream)
+        conn.continuation_stream_id = frame.stream_id 
+        # Track the target stream for these headers (the new pushed stream)
+        conn.pending_push_promise_id = frame.promised_stream_id
+    else
+        # The header block is complete. Decode and assign.
+        decoded_headers = HPACK.decode_headers(conn.hpack_decoder, frame.header_block_fragment)
+        promised_stream.headers = decoded_headers
+        @debug "[CLIENT] Processed complete PUSH_PROMISE for stream $(promised_stream.id)."
     end
-    
-    decoded_headers = HPACK.decode_headers(conn.hpack_decoder, frame.header_block_fragment)
-    promised_stream.headers = decoded_headers
 end
 
 """
@@ -891,19 +933,34 @@ if the connection is currently open, and then closes all streams and the underly
 This function is thread-safe.
 """
 function close_connection!(conn::HTTP2Connection, error_code::Symbol = :NO_ERROR, debug_message::String = "")
-    @lock conn.lock begin
-        if isopen(conn.socket)
-            last_stream_id = get_highest_stream_id(conn) |> UInt32
-            send_goaway!(conn, last_stream_id, error_code, debug_message)
+    # Acquire locks in a consistent order to prevent deadlock.
+    @lock conn.state_lock begin
+        @lock conn.streams_lock begin
+            if conn.state == CONNECTION_CLOSED
+                return
+            end
+
+            if isopen(conn.socket)
+                last_stream_id = get_highest_stream_id(conn) |> UInt32
+                # This will try to acquire state_lock again, which is fine because it's a ReentrantLock
+                send_goaway!(conn, last_stream_id, error_code, debug_message)
+            end
+
+            for stream in values(conn.streams)
+                Streams.mux_close_stream!(conn.multiplexer, stream.id, error_code)
+            end
+
+            empty!(conn.streams)
+
+            try
+                close(conn.socket)
+            catch
+                # Ignore errors on close
+            end
+            
+            # This will try to acquire state_lock again, which is fine.
+            transition_state!(conn, CONNECTION_CLOSED)
         end
-        for stream in values(conn.streams)
-            Streams.mux_close_stream!(conn.multiplexer, stream.id, error_code)
-        end
-        try
-            close(conn.socket)
-        catch
-        end
-        conn.state = CONNECTION_CLOSED
     end
 end
 
@@ -928,7 +985,7 @@ Queues a GOAWAY frame for sending via the multiplexer and transitions the connec
 This is the single, correct way to send a GOAWAY frame.
 """
 function send_goaway!(conn::HTTP2Connection, last_stream_id::UInt32, error_code::Symbol=:NO_ERROR, debug_message::String="")
-    @lock conn.lock begin
+    @lock conn.state_lock begin
         if conn.goaway_sent
             return
         end
@@ -950,10 +1007,12 @@ end
 Get the highest stream ID that has been processed on this connection.
 """
 function get_highest_stream_id(connection::HTTP2Connection)
-    if !isempty(connection.streams)
-        return maximum(keys(connection.streams))
-    else
-        return 0  # No streams processed yet
+    @lock connection.streams_lock begin # <-- Ensure this uses "connection"
+        if !isempty(connection.streams)
+            return maximum(keys(connection.streams))
+        else
+            return 0
+        end
     end
 end
 
@@ -979,11 +1038,13 @@ end
 Increases the connection-level send window. Called on receipt of a WINDOW_UPDATE.
 """
 function update_send_window!(conn::HTTP2Connection, increment::UInt32)
-    new_window = Int64(conn.send_window) + Int64(increment)
-    if new_window > MAX_WINDOW_SIZE
-        throw(FlowControlError("Connection send window overflow", 0))
+    @lock conn.flow_control_lock begin
+        new_window = Int64(conn.send_window) + Int64(increment)
+        if new_window > MAX_WINDOW_SIZE
+            throw(FlowControlError("Connection send window overflow", 0))
+        end
+        conn.send_window = Int32(new_window)
     end
-    conn.send_window = Int32(new_window)
 end
 
 """
@@ -1010,7 +1071,9 @@ function consume_receive_window!(stream::HTTP2Stream, amount::Int)
         throw(FlowControlError("Received more data than the advertised window size", stream.id))
     end
     stream.receive_window -= amount
-    conn.receive_window -= amount
+    @lock conn.flow_control_lock begin
+        conn.receive_window -= amount
+    end
 end
 
 
@@ -1043,23 +1106,23 @@ adjusting each stream's `send_window`. Throws a FlowControlError on overflow.
 """
 function _update_all_stream_send_windows_unsafe!(conn::HTTP2Connection, difference::Int64)
     println("[FlowControl] Updating all stream send windows by: $difference (unsafe version)")
-    
+    @lock conn.flow_control_lock begin
     for stream in values(conn.streams)
-        new_window = Int64(stream.send_window) + difference
-        
-        if new_window > MAX_WINDOW_SIZE
-            throw(FlowControlError("Stream send window overflow due to SETTINGS update", stream.id))
+            new_window = Int64(stream.send_window) + difference
+            
+            if new_window > MAX_WINDOW_SIZE
+                throw(FlowControlError("Stream send window overflow due to SETTINGS update", stream.id))
+            end
+            
+            stream.send_window = Int32(new_window)
+            println("[FlowControl] Updated stream $(stream.id) send window to: $(stream.send_window)")
         end
-        
-        stream.send_window = Int32(new_window)
-        println("[FlowControl] Updated stream $(stream.id) send window to: $(stream.send_window)")
     end
-    
     println("[FlowControl] All stream send windows updated successfully")
 end
 
 function update_all_stream_send_windows!(conn::HTTP2Connection, difference::Int64)
-    @lock conn.lock begin
+    @lock conn.streams_lock begin
         _update_all_stream_send_windows_unsafe!(conn, difference)
     end
 end
@@ -1107,16 +1170,17 @@ Handle a connection-level error: send GOAWAY, close streams, and transition to C
 """
 
 function handle_connection_error!(conn::HTTP2Connection, error_code::Symbol, msg::AbstractString = "")
-    if is_closed(conn)
-        return
-    end
+    @lock conn.state_lock begin
+        if conn.state == CONNECTION_CLOSED 
+            return
+        end
+        @error "Connection Error" msg error_code
 
-    @error "Connection Error" msg error_code
-
-    if conn.state == CONNECTION_IDLE
-        transition_state!(conn, CONNECTION_CLOSED)
-    else
-        transition_state!(conn, CONNECTION_CLOSING)
+        if conn.state == CONNECTION_IDLE
+            transition_state!(conn, CONNECTION_CLOSED)
+        else
+            transition_state!(conn, CONNECTION_CLOSING)
+        end
     end
 end
 
@@ -1131,18 +1195,20 @@ Transition the connection to a new state, enforcing valid transitions.
 Throws if the transition is invalid.
 """
 function transition_state!(conn::AbstractHTTP2Connection, new_state::ConnectionState)
-    old_state = conn.state
-    if old_state == new_state
-        return
-    end
+    @lock conn.state_lock begin
+        old_state = conn.state
+        if old_state == new_state
+            return
+        end
 
-    if !is_valid_transition(Val(old_state), Val(new_state))
-        throw(ProtocolError("Invalid connection state transition: $old_state → $new_state"))
+        if !is_valid_transition(Val(old_state), Val(new_state))
+            throw(ProtocolError("Invalid connection state transition: $old_state → $new_state"))
+        end
+        
+        @debug "State Transition: $old_state → $new_state"
+        conn.state = new_state
     end
-    
-    @debug "State Transition: $old_state → $new_state"
-    conn.state = new_state
-end
+    end
 
 is_valid_transition(from::ConnectionState, to::ConnectionState) = false
 
@@ -1180,7 +1246,7 @@ function send_frame(conn::HTTP2Connection, frame_bytes::Vector{UInt8})
         return
     end
     try
-        @lock conn.lock begin
+        @lock conn.socket_lock begin # <-- Use the new socket_lock
             write(conn.socket, frame_bytes)
             flush(conn.socket)
         end
@@ -1202,10 +1268,12 @@ function send_goaway!(conn::HTTP2Connection, error_code::Symbol=:NO_ERROR, msg::
     if conn.state in (CONNECTION_CLOSED, CONNECTION_GOAWAY_SENT)
         return
     end
-    goaway = GoAwayFrame(conn.last_peer_stream_id, error_code, Vector{UInt8}(msg))
-    send_frame(conn, serialize_payload(goaway))
-    conn.goaway_sent = true
-    transition_state!(conn, CONNECTION_GOAWAY_SENT)
+    @lock conn.state_lock begin
+        goaway = GoAwayFrame(conn.last_peer_stream_id, error_code, Vector{UInt8}(msg))
+        send_frame(conn, serialize_payload(goaway))
+        conn.goaway_sent = true
+        transition_state!(conn, CONNECTION_GOAWAY_SENT)
+    end
 end
 
 """

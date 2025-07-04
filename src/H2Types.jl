@@ -393,6 +393,7 @@ Implements the IO interface for reading stream data.
 - `headers_available::Base.GenericCondition`: Condition for header availability
 """
 mutable struct HTTP2Stream <: IO
+    const lock::ReentrantLock 
     const id::UInt32
     const connection::AbstractHTTP2Connection
     state::StreamState
@@ -519,8 +520,15 @@ mutable struct HTTP2Connection <: AbstractHTTP2Connection
     last_error::Union{Nothing, ConnectionError}
     continuation_stream_id::UInt32
     continuation_end_stream::Bool
-    lock::ReentrantLock
-    decoder_lock::ReentrantLock
+    pending_push_promise_id::UInt32
+  # --- New Granular Locks ---
+    state_lock::ReentrantLock           # Protects connection state (state, goaway_sent, etc.)
+    streams_lock::ReentrantLock         # Protects the streams dictionary and stream IDs
+    flow_control_lock::ReentrantLock    # Protects connection-level window sizes
+    pings_lock::ReentrantLock 
+    socket_lock::ReentrantLock           # Protects the pending_pings dictionary
+    decoder_lock::ReentrantLock         # Unchanged: specific to the HPACK decoder
+    # ---
     pending_pings::Dict{UInt64, Tuple{Float64, Channel{Float64}}}
     callbacks::Dict{Symbol, Function}
     request_handler::Union{Any, Nothing}
@@ -537,7 +545,10 @@ mutable struct HTTP2Connection <: AbstractHTTP2Connection
         conn_id = string(uuid4())
         streams = Dict{UInt32, HTTP2Stream}()
         encoder = HPACKEncoder(settings.header_table_size)
-        decoder = HPACKDecoder(UInt32(DEFAULT_HEADER_TABLE_SIZE)) 
+        decoder = HPACKDecoder(
+            settings.header_table_size, 
+            Int(settings.max_header_list_size)
+        )
         frame_channel = Channel{HTTP2Frame}(128)
         preface_handshake_done = Condition()
         header_buffer = IOBuffer()
@@ -560,7 +571,12 @@ mutable struct HTTP2Connection <: AbstractHTTP2Connection
         conn.last_error = nothing
         conn.continuation_stream_id = UInt32(0)
         conn.continuation_end_stream = false
-        conn.lock = ReentrantLock()
+        conn.pending_push_promise_id = UInt32(0)
+        conn.state_lock = ReentrantLock()
+        conn.streams_lock = ReentrantLock()
+        conn.flow_control_lock = ReentrantLock()
+        conn.pings_lock = ReentrantLock()
+        conn.socket_lock = ReentrantLock()
         conn.decoder_lock = ReentrantLock()
         conn.pending_pings = Dict{UInt64, Tuple{Float64, Channel{Float64}}}()
         conn.callbacks = Dict{Symbol, Function}()
@@ -590,8 +606,10 @@ Initializes the stream in IDLE state with default flow control windows.
 function HTTP2Stream(id::Integer, conn::HTTP2Connection)
     initial_window_size = conn.settings.initial_window_size
     the_buffer = IOBuffer()
+    stream_lock = ReentrantLock() # Create the stream's own lock
 
     stream = HTTP2Stream(
+        stream_lock, # Pass the new lock to the struct
         UInt32(id),
         conn,
         STREAM_IDLE,
@@ -606,9 +624,9 @@ function HTTP2Stream(id::Integer, conn::HTTP2Connection)
         false,
         now(),
         now(),
-        ReentrantLock(),
-        Base.GenericCondition(conn.lock),
-        Base.GenericCondition(conn.lock)
+        ReentrantLock(), # This is the old buffer_lock
+        Base.GenericCondition(stream_lock), # Use the new stream_lock
+        Base.GenericCondition(stream_lock)  # Use the new stream_lock
     )
 
     return stream
@@ -845,7 +863,7 @@ function Base.bytesavailable(s::HTTP2Stream)
 end
 
 function Base.close(s::HTTP2Stream)
-    @lock s.connection.lock begin
+    @lock s.lock begin
         if s.state != STREAM_CLOSED
             s.state = STREAM_CLOSED
             notify(s.data_available; all=true)

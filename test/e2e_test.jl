@@ -64,6 +64,61 @@ using H2
         H2.Streams.mux_close_stream!(stream.connection.multiplexer, stream.id, :CANCEL)
         return HTTP.Response(200) 
     end)
+    # Add this with your other HTTP.register! calls
+
+    HTTP.register!(E2E_ROUTER, "GET", "/push-continuation-test", req -> begin
+        @info ("SERVER: Initiating push with continuation for /style.css")
+        original_stream = req.context[:stream]
+        conn = original_stream.connection
+
+        # Manually create and register the promised stream
+        promised_stream_id = H2.Connection.next_stream_id(conn)
+        promised_stream = H2.HTTP2Stream(promised_stream_id, conn)
+        H2.Connection.add_stream(conn, promised_stream)
+        H2.Streams.register_stream!(conn.multiplexer, promised_stream)
+        H2.Streams.transition_stream_state!(promised_stream, :send_push_promise)
+
+        # 1. Create many small headers to exceed the frame size without violating HPACK limits
+        pushed_req_headers = [
+            ":method" => "GET",
+            ":scheme" => "https",
+            ":authority" => "127.0.0.1:8008",
+            ":path" => "/style.css"
+        ]
+        # Generate enough headers to require fragmentation
+        for i in 1:400
+            push!(pushed_req_headers, "x-custom-header-$i" => "value-$i-for-a-long-enough-string-to-fill-space")
+        end
+        
+        # 2. Manually encode and split the header block
+        full_header_block = H2.HPACK.encode_headers(conn.hpack_encoder, pushed_req_headers)
+        split_point = 16384 # Max frame size
+        fragment1 = full_header_block[1:split_point]
+        fragment2 = full_header_block[split_point+1:end]
+
+        # 3. Create and send the PUSH_PROMISE (with end_headers=false)
+        push_promise_frame = H2.H2Frames.PushPromiseFrame(
+            original_stream.id, promised_stream.id, fragment1; end_headers=false
+        )
+        H2.Connection.send_frame(conn, H2.H2Frames.serialize_frame(push_promise_frame))
+
+        # 4. Create and send the CONTINUATION frame
+        continuation_frame = H2.H2Frames.ContinuationFrame(
+            original_stream.id, fragment2; end_headers=true
+        )
+        H2.Connection.send_frame(conn, H2.H2Frames.serialize_frame(continuation_frame))
+
+        # 5. Spawn the task to send the actual response for the pushed stream
+        errormonitor(@async begin
+            pushed_response_headers = [":status" => "200", "content-type" => "text/css"]
+            pushed_body = Vector{UInt8}("pushed-with-continuation")
+            H2.Connection.send_headers!(promised_stream, pushed_response_headers; end_stream=false)
+            H2.Connection.send_data!(promised_stream, pushed_body; end_stream=true)
+        end)
+
+        # 6. Return the main response
+        return HTTP.Response(200, "Main Continuation Test Response")
+    end)
 
     HTTP.register!(E2E_ROUTER, "GET", "/shutdown", req -> begin
         response = HTTP.Response(200, "I'm shutting down!")
@@ -86,14 +141,19 @@ using H2
     CERT_PATH = get(ENV, "CERT_PATH", joinpath(homedir(), ".mbedtls", "cert.pem"))
     KEY_PATH = get(ENV, "KEY_PATH", joinpath(homedir(), ".mbedtls", "key.pem"))
 
+    # Create server settings with a large limit for the continuation test
+    server_settings_for_test = H2.H2Settings.create_server_settings()
+    server_settings_for_test.max_header_list_size = 65536
+
     server_task = errormonitor(@async H2.serve(
         h2_handler, 
         HOST, 
-        PORT; 
+        PORT;
         is_tls=true, 
         cert_file=CERT_PATH, 
         key_file=KEY_PATH,
-        ready_channel=startup_channel
+        ready_channel=startup_channel,
+        settings=server_settings_for_test # <-- PASS THE SETTINGS
     ))
         
     client = nothing
@@ -156,40 +216,58 @@ using H2
         end
 
         @testset "Server Push Promise" begin
-            @info ("Testing Server Push Promise...")
+            @info ("Testing Server Push Promise with push ENABLED on client...")
             
-            resp = H2.request(client, "GET", "/push-test")
-            body = String(resp.body)
-            @test resp.status == 200
-            @test occursin("/style.css", body)
+            # Create custom settings for a client that ACCEPTS server push
+            push_enabled_settings = H2.H2Settings.create_client_settings()
+            push_enabled_settings.enable_push = true
 
+            # Create a new client instance just for this test
+            push_client = nothing
+            try
+                push_client = H2.connect(HOST, PORT; is_tls=true, verify_peer=false, settings=push_enabled_settings)
+                @test H2.Connection.is_open(push_client.conn)
 
-            pushed_stream = nothing
-            for _ in 1:100
-                @lock client.conn.lock begin
-                    for (id, stream) in client.conn.streams
-                        if iseven(id)
-                            pushed_stream = stream
-                            break
+                # Make the request that triggers the push
+                resp = H2.request(push_client, "GET", "/push-test")
+                body = String(resp.body)
+                @test resp.status == 200
+                @test occursin("/style.css", body)
+
+                # Find the pushed stream (it should exist and be open)
+                pushed_stream = nothing
+                for _ in 1:100 # Poll for a short time to find the stream
+                    @lock push_client.conn.streams_lock begin
+                        # Find the even-numbered stream created by the server
+                        for (id, stream) in push_client.conn.streams
+                            if iseven(id) && H2.is_active(stream)
+                                pushed_stream = stream
+                                break
+                            end
                         end
                     end
+                    if pushed_stream !== nothing
+                        break
+                    end
+                    sleep(0.05)
                 end
+                
+                @test pushed_stream !== nothing
                 if pushed_stream !== nothing
-                    break
+                    @info ("CLIENT: Found pushed stream $(pushed_stream.id). Waiting for its headers and body...")
+                    pushed_resp_headers = H2.Streams.wait_for_headers(pushed_stream)
+                    pushed_body = H2.Streams.wait_for_body(pushed_stream)
+                    str_pushed_body = String(pushed_body)
+                    status_str = get(Dict(pushed_resp_headers), ":status", "0")
+                    
+                    @test parse(Int, status_str) == 200
+                    @test str_pushed_body == "body { color: red; }"
+                    @info ("Server Push Promise test completed successfully.")
                 end
-                sleep(0.02)
-            end
-            
-            @test pushed_stream !== nothing 
-            if pushed_stream !== nothing
-                @info ("CLIENT: Found pushed stream $(pushed_stream.id). Waiting for its headers and body...")
-                pushed_resp_headers = H2.Streams.wait_for_headers(pushed_stream)
-                pushed_body = H2.Streams.wait_for_body(pushed_stream)
-                str_pushed_body = String(pushed_body)
-                status_str = get(Dict(pushed_resp_headers), ":status", "0")
-                @test parse(Int, status_str) == 200
-                @test str_pushed_body == "body { color: red; }"
-                @info ("Server Push Promise test completed successfully.")
+            finally
+                if push_client !== nothing
+                    H2.close(push_client)
+                end
             end
         end
 
@@ -326,6 +404,49 @@ using H2
             
             H2.close(client_rl)
             @info ("Rate Limiting test completed.")
+        end
+
+
+        @testset "Server Push with Large Headers (Continuation)" begin
+            @info ("Testing Server Push with Continuation...")
+            
+            push_enabled_settings = H2.H2Settings.create_client_settings()
+            push_enabled_settings.enable_push = true
+            push_enabled_settings.max_header_list_size = 65536 # A comfortably large value
+
+            push_client = nothing
+            try
+                push_client = H2.connect(HOST, PORT; is_tls=true, verify_peer=false, settings=push_enabled_settings)
+                
+                resp = H2.request(push_client, "GET", "/push-continuation-test")
+                @test resp.status == 200
+
+                # Find the pushed stream
+                pushed_stream = nothing
+                for _ in 1:100
+                    @lock push_client.conn.streams_lock begin
+                        pushed_stream = H2.Connection.get_stream(push_client.conn, UInt32(2))
+                    end
+                    (pushed_stream !== nothing && !isempty(pushed_stream.headers)) && break
+                    sleep(0.05)
+                end
+                
+                @test pushed_stream !== nothing
+
+            @test pushed_stream !== nothing
+            if pushed_stream !== nothing
+                @test length(pushed_stream.headers) == 404
+                pushed_resp_headers = H2.Streams.wait_for_headers(pushed_stream)
+                pushed_body = H2.Streams.wait_for_body(pushed_stream)
+                
+                @test parse(Int, get(Dict(pushed_resp_headers), ":status", "0")) == 200
+                @test String(pushed_body) == "pushed-with-continuation"
+            end
+            finally
+                if push_client !== nothing
+                    H2.close(push_client)
+                end
+            end
         end
 
     finally
