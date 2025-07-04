@@ -44,7 +44,13 @@ Returns:
 Throws:
 - `ErrorException` if the handshake times out or connection fails.
 """
-function connect(host::String, port::Int64; is_tls=true, timeout=10.0, settings::Union{HTTP2Settings, Nothing}=nothing, kwargs...)
+function connect(host::String, port::Int64; is_tls=true, timeout=10.0,max_concurrent_streams::Union{Integer, Nothing}=nothing,
+                 initial_window_size::Union{Integer, Nothing}=nothing,
+                 max_frame_size::Union{Integer, Nothing}=nothing,
+                 # Keep the original for advanced use
+                 settings::Union{HTTP2Settings, Nothing}=nothing, 
+                 kwargs...)
+
     local socket::IO
     
     if is_tls
@@ -52,8 +58,17 @@ function connect(host::String, port::Int64; is_tls=true, timeout=10.0, settings:
     else
         socket = Sockets.connect(host, port)
     end
-    
-    client_settings = (settings === nothing) ? H2Settings.create_client_settings() : settings
+
+    local client_settings::HTTP2Settings
+    if settings !== nothing
+        client_settings = settings
+    else
+        client_settings = H2Settings.create_client_settings()
+    end
+
+    if max_concurrent_streams !== nothing; client_settings.max_concurrent_streams = UInt32(max_concurrent_streams); end
+    if initial_window_size !== nothing; client_settings.initial_window_size = UInt32(initial_window_size); end
+    if max_frame_size !== nothing; client_settings.max_frame_size = UInt32(max_frame_size); end
 
     @info "Client: Connecting to $host:$port (TLS: $is_tls)"
     
@@ -97,7 +112,7 @@ function ensure_connection_ready(conn::HTTP2Connection; timeout=10.0)
 end
 
 """
-    request(client::HTTP2Client, method::String, path::String; headers=[], body=nothing) -> HTTP2Response
+    request(client::HTTP2Client, method::String, path::String; headers=[], body=nothing, timeout=30.0) -> HTTP2Response
 
 Send an HTTP/2 request and wait for the response.
 
@@ -105,6 +120,7 @@ Arguments:
 - `client::HTTP2Client`: The client object.
 - `method::String`: HTTP method (e.g. "GET", "POST").
 - `path::String`: The request path (e.g. "/api").
+- `timeout::Float64`: Time in seconds to wait for the full response before throwing a timeout error. A value of 0 means no timeout.
 
 Keyword Arguments:
 - `headers::Vector{Pair{String,String}}=[]`: Additional request headers.
@@ -117,9 +133,11 @@ Throws:
 - `ProtocolError` if the connection is shutting down.
 - `StreamError` if the stream is reset by the peer.
 """
+
 function request(client::HTTP2Client, method::String, path::String;
                  headers::Vector{Pair{String,String}} = Pair{String,String}[],
-                 body::Union{Vector{UInt8},Nothing} = nothing)
+                 body::Union{Vector{UInt8}, IO, Nothing} = nothing,
+                 timeout::Float64 = 30.0)
     conn = client.conn
 
     @lock conn.state_lock begin
@@ -129,31 +147,66 @@ function request(client::HTTP2Client, method::String, path::String;
     end
 
     ensure_connection_ready(conn)
+   
     stream = Streams.open_stream!(conn.multiplexer)
-    scheme = isa(conn.socket, MbedTLS.SSLContext) ? "https" : "http"
-    all_headers = [
-        ":method" => method,
-        ":scheme" => scheme,
-        ":authority" => conn.host,
-        ":path" => path
-    ]
-    append!(all_headers, headers)
-    send_headers!(stream, all_headers; end_stream = isnothing(body))
-    if !isnothing(body)
-        send_data!(stream, body; end_stream = true)
+    
+    function cleanup_on_timeout()
+        if is_active(stream)
+            @warn "[Client] Request for stream $(stream.id) timed out after $(timeout)s."
+            Streams.mux_close_stream!(conn.multiplexer, stream.id, :CANCEL)
+        end
     end
-    resp_headers = wait_for_headers(stream)
-    if !is_active(stream) && isempty(resp_headers)
-        # Απλώς περνάμε το Symbol 'CANCEL' απευθείας.
-        throw(StreamError(CANCEL, "Stream was reset by the peer.", stream.id))
+
+    request_timer = timeout > 0 ? Timer(_ -> cleanup_on_timeout(), timeout) : nothing
+
+    try
+        scheme = isa(conn.socket, MbedTLS.SSLContext) ? "https" : "http"
+        all_headers = [
+            ":method" => method,
+            ":scheme" => scheme,
+            ":authority" => conn.host,
+            ":path" => path
+        ]
+        append!(all_headers, headers)
+        
+        send_headers!(stream, all_headers; end_stream=isnothing(body))
+
+        if body isa Vector{UInt8}
+            send_data!(stream, body; end_stream=true)
+        elseif body isa IO
+            @info "[Client] Streaming request body for stream $(stream.id)"
+            
+            buffer_size = Int(conn.remote_settings.max_frame_size)
+            
+            while !eof(body)
+                chunk = read(body, buffer_size)
+                is_last_chunk = eof(body)
+                send_data!(stream, chunk; end_stream=is_last_chunk)
+            end
+        end
+      
+        resp_headers = wait_for_headers(stream) 
+
+        # The stream might have been closed by the timeout
+        if !is_active(stream) && isempty(resp_headers)
+            throw(StreamError(CANCEL, "Request timed out or was reset by peer.", stream.id))
+        end
+
+        resp_body = wait_for_body(stream)
+        status_str = get(Dict(resp_headers), ":status", "0")
+        
+        return HTTP2Response(
+            parse(Int, status_str),
+            filter(h -> !startswith(h.first, ":"), resp_headers),
+            resp_body
+        )
+    finally
+        # Always ensure the timer is closed
+        if request_timer !== nothing
+            # Correction 2: More idiomatic close.
+            Base.close(request_timer)
+        end
     end
-    resp_body = wait_for_body(stream)
-    status_str = get(Dict(resp_headers), ":status", "0")
-    return HTTP2Response(
-        parse(Int, status_str),
-        filter(h -> !startswith(h.first, ":"), resp_headers),
-        resp_body
-    )
 end
 
 """

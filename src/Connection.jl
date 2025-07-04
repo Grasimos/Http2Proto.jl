@@ -439,6 +439,12 @@ function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame:
         conn.continuation_end_stream = frame.end_stream 
     else
         @debug "[$role][T$(Threads.threadid())] ┣━ DECODING headers for stream $(stream.id)..."
+        header_block = frame.header_block_fragment
+        
+        # Enforce MAX_HEADER_LIST_SIZE
+        if length(header_block) > conn.remote_settings.max_header_list_size
+            throw(ProtocolError("Header block size exceeds peer's MAX_HEADER_LIST_SIZE"))
+        end
         local decoded_headers
         decoded_headers = HPACK.decode_headers(conn.hpack_decoder, frame.header_block_fragment)
         @debug "[$role][T$(Threads.threadid())] ┣━ CALLING receive_headers! for stream $(stream.id)..."
@@ -467,7 +473,6 @@ function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame:
     end
     @debug "[$role][T$(Threads.threadid())] ┣━ Buffering CONTINUATION fragment for stream $(stream.id)..."
     write(conn.header_buffer, frame.header_block_fragment)
-
    if frame.end_headers
         full_header_block = take!(conn.header_buffer)
         promised_id = conn.pending_push_promise_id
@@ -477,12 +482,10 @@ function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame:
 
         decoded_headers = HPACK.decode_headers(conn.hpack_decoder, full_header_block)
 
-        # NEW LOGIC: Was this a PUSH_PROMISE continuation?
         if promised_id != 0
-            # Yes. Find the PROMISED stream and assign its headers.
             promised_stream = get_stream(conn, promised_id)
             if promised_stream !== nothing
-                promised_stream.headers = decoded_headers
+                receive_headers!(promised_stream, decoded_headers; end_stream=false)
                 @debug "[CLIENT] Finished PUSH_PROMISE continuation for stream $(promised_id)."
             end
         else
@@ -527,15 +530,12 @@ end
 Processes a PUSH_PROMISE frame.
 """
 function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame::PushPromiseFrame)
-    # This function is called for PUSH_PROMISE on an *existing* stream,
-    # which is primarily for client-side handling.
     if is_client(conn)
         role = "CLIENT"
         @debug "[$role][T$(Threads.threadid())] ┣━ Processing PUSH_PROMISE for associated stream $(stream.id)..." 
         process_push_promise(conn, frame)
         @debug "[$role][T$(Threads.threadid())] ┗━ PUSH_PROMISE for stream $(frame.promised_stream_id) processed." 
     else
-        # A server should not receive a PUSH_PROMISE. This is a protocol error.
         throw(ProtocolError("Server received a PUSH_PROMISE frame on stream $(stream.id)"))
     end
     @debug "[$role][T$(Threads.threadid())] Frame Processing: <<<< FINISHED >>>> for frame on stream $sid."
@@ -888,8 +888,9 @@ function apply_flow_control_update(frame::WindowUpdateFrame, conn::HTTP2Connecti
         if stream !== nothing
             update_send_window!(stream, frame.window_size_increment)
         else
-            # Αγνοούμε το WINDOW_UPDATE για κλειστό/ανύπαρκτο stream (εκτός του 0)
-            # @debug "Ignoring WINDOW_UPDATE for non-existent stream" stream_id=frame.stream_id
+           # Per RFC 7540, 6.9: A receiver MUST treat the receipt of a
+           # WINDOW_UPDATE frame on a closed stream as a connection error.
+           throw(ProtocolError("Received WINDOW_UPDATE for closed or non-existent stream $(frame.stream_id)"))
         end
     end
 end
@@ -926,42 +927,79 @@ end
 
 
 """
-    close_connection!(conn::HTTP2Connection, error_code::Symbol = :NO_ERROR, debug_message::String = "")
+    close_connection!(conn::HTTP2Connection, error_code::Symbol = :NO_ERROR, 
+debug_message::String = ""; grace_period::Float64 = 5.0)
 
 Shuts down the connection. Sends a GOAWAY frame with an optional debug message
 if the connection is currently open, and then closes all streams and the underlying socket.
 This function is thread-safe.
+
+Arguments:
+- `conn::HTTP2Connection`: The connection to close.
+- `error_code::Symbol`: The error code for the GOAWAY frame.
+- `debug_message::String`: An optional debug message.
+- `grace_period::Float64`: Time in seconds to wait for active streams to complete before force-closing.
 """
-function close_connection!(conn::HTTP2Connection, error_code::Symbol = :NO_ERROR, debug_message::String = "")
+function close_connection!(conn::HTTP2Connection, error_code::Symbol = :NO_ERROR, debug_message::String = ""; grace_period::Float64 = 5.0)
     # Acquire locks in a consistent order to prevent deadlock.
     @lock conn.state_lock begin
+        if conn.state == CONNECTION_CLOSED
+            return
+        end
+
+        local streams_to_watch::Vector{HTTP2Stream}
+
         @lock conn.streams_lock begin
-            if conn.state == CONNECTION_CLOSED
-                return
-            end
+            # Identify streams that should be allowed to finish.
+            streams_to_watch = [s for s in values(conn.streams) if is_active(s)]
 
             if isopen(conn.socket)
-                last_stream_id = get_highest_stream_id(conn) |> UInt32
-                # This will try to acquire state_lock again, which is fine because it's a ReentrantLock
+    
+            last_stream_id = get_highest_stream_id(conn) |> UInt32
                 send_goaway!(conn, last_stream_id, error_code, debug_message)
             end
+        end # Release streams_lock
 
+        # Graceful wait period (occurs outside the streams_lock)
+        if !isempty(streams_to_watch) && grace_period > 0
+            @info "[Conn] Graceful shutdown initiated. Waiting up to $(grace_period)s for $(length(streams_to_watch)) active streams."
+            start_time = time()
+            while (time() - start_time) < grace_period
+                # Remove streams that have closed.
+                filter!(is_active, streams_to_watch)
+                if isempty(streams_to_watch)
+                    @info "[Conn] All active streams closed gracefully."
+                    break
+                end
+                sleep(0.1) # Check every 100ms
+            end
+
+            if !isempty(streams_to_watch)
+                @warn "[Conn] Grace period ended. $(length(streams_to_watch)) streams still active. Force-closing."
+            end
+        end
+        
+        # Final cleanup (re-acquire streams_lock)
+        @lock conn.streams_lock begin
             for stream in values(conn.streams)
-                Streams.mux_close_stream!(conn.multiplexer, stream.id, error_code)
+        
+        Streams.mux_close_stream!(conn.multiplexer, stream.id, error_code)
             end
 
             empty!(conn.streams)
 
             try
-                close(conn.socket)
+                if isopen(conn.socket)
+                    close(conn.socket)
+                end
             catch
                 # Ignore errors on close
-            end
+      
+      end
             
-            # This will try to acquire state_lock again, which is fine.
-            transition_state!(conn, CONNECTION_CLOSED)
-        end
-    end
+    transition_state!(conn, CONNECTION_CLOSED)
+        end # Release streams_lock
+    end # Release state_lock
 end
 
 """

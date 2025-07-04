@@ -221,9 +221,7 @@ using H2
             # Create custom settings for a client that ACCEPTS server push
             push_enabled_settings = H2.H2Settings.create_client_settings()
             push_enabled_settings.enable_push = true
-
-            # Create a new client instance just for this test
-            push_client = nothing
+            push_client = H2.connect(HOST, PORT; is_tls=true, verify_peer=false, settings=push_enabled_settings)
             try
                 push_client = H2.connect(HOST, PORT; is_tls=true, verify_peer=false, settings=push_enabled_settings)
                 @test H2.Connection.is_open(push_client.conn)
