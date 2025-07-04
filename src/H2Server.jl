@@ -30,7 +30,7 @@ function serve(handler, host::AbstractString="0.0.0.0", port::Integer=8080;
         put!(ready_channel, true)
     end
 
-    server_settings = (settings === nothing) ? create_server_settings() : settings # <-- Use settings
+    server_settings = (settings === nothing) ? create_server_settings() : settings 
 
     @info "H2 Server listening on $host:$port (TLS: $is_tls)..."
     
@@ -88,6 +88,30 @@ function handle_new_connection(sock::IO, settings::HTTP2Settings, handler, host:
             close(sock)
         end
     end
+end
+
+"""
+    push_promise!(conn::HTTP2Connection, original_stream::HTTP2Stream, method::String, path::String, headers::Vector{<:Pair}=Pair{String, String}[])
+
+A higher-level helper for server push. Automatically creates the required pseudo-headers
+and sends a PUSH_PROMISE frame. Returns the promised stream.
+"""
+function push_promise!(conn::HTTP2Connection, original_stream::HTTP2Stream, method::String, path::String, headers::Vector{<:Pair}=Pair{String, String}[])
+    # Automatically determine scheme and authority from the connection
+    scheme = isa(conn.socket, MbedTLS.SSLContext) ? "https" : "http"
+    authority = conn.host # Assuming conn.host stores the authority (e.g., "localhost:8080")
+
+    # Construct the full set of request headers for the promised resource
+    request_headers = [
+        ":method" => method,
+        ":scheme" => scheme,
+        ":authority" => authority,
+        ":path" => path
+    ]
+    append!(request_headers, headers)
+
+    # Call the existing, lower-level push_promise! function
+    return push_promise!(conn, original_stream, request_headers)
 end
 
 """

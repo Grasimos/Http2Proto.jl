@@ -44,6 +44,7 @@ Handle an incoming HTTP/2 stream using the wrapped HTTP.Router.
 - If the stream is closed by the handler, no response is sent.
 - All exceptions are logged and a 500 error is sent if possible.
 """
+
 function (h2r::H2Router)(conn::HTTP2Connection, stream::HTTP2Stream)
     @info "H2Router: Handling request on stream $(stream.id)"
     try
@@ -53,20 +54,39 @@ function (h2r::H2Router)(conn::HTTP2Connection, stream::HTTP2Stream)
         method = String(HTTP.header(http_headers, ":method", "GET"))
         path = String(HTTP.header(http_headers, ":path", "/"))
         http_request = HTTP.Request(method, path, http_headers, req_body_bytes; context=Dict(:stream => stream))
+        
         http_response::HTTP.Response = h2r.router(http_request)
-        @info "H2Router: Application returned HTTP.Response with status $(http_response.status)"
+    
+    @info "H2Router: Application returned HTTP.Response with status $(http_response.status)"
         if !is_active(stream)
             @info "H2Router: Stream $(stream.id) was closed by the handler. Not sending a response."
             return
         end
+        
         response_headers = [":status" => string(http_response.status); http_response.headers]
-        if isempty(http_response.body)
+        
+        # Check if the body is a stream
+        if http_response.body isa IO
+            Connection.send_headers!(stream, response_headers; end_stream=false)
+            @info "H2Router: Streaming response body for stream $(stream.id)"
+            
+            body_stream = http_response.body
+            buffer_size = 4096 # Read in 4KB chunks
+            
+            while !eof(body_stream)
+                chunk = read(body_stream, buffer_size)
+                is_last_chunk = eof(body_stream)
+                Connection.send_data!(stream, chunk; end_stream=is_last_chunk)
+            end
+        elseif isempty(http_response.body)
             Connection.send_headers!(stream, response_headers; end_stream=true)
         else
             Connection.send_headers!(stream, response_headers; end_stream=false)
             response_body_bytes = Vector{UInt8}(http_response.body)
-            Connection.send_data!(stream, response_body_bytes; end_stream=true)
+     
+       Connection.send_data!(stream, response_body_bytes; end_stream=true)
         end
+
         @info "H2Router: Successfully handled and sent response for stream $(stream.id)."
 
     catch e
@@ -74,15 +94,16 @@ function (h2r::H2Router)(conn::HTTP2Connection, stream::HTTP2Stream)
         try
             if is_active(stream)
                 error_headers = [":status" => "500"]
-                Connection.send_headers!(stream, error_headers; end_stream=true)
+    
+            Connection.send_headers!(stream, error_headers; end_stream=true)
                 @warn "H2Router: Sent 500 error response to client."
             end
         catch inner_e
             @error "H2Router: Failed to send 500 error response." exception=inner_e
         end
     finally
-        @info "H2Router: Handler for stream $(stream.id) finished."
+        @info "H2Router: 
+Handler for stream $(stream.id) finished."
     end
 end
-
 end # module
