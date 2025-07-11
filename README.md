@@ -1,28 +1,18 @@
 # H2.jl
 
-A high-performance, native Julia implementation of the HTTP/2 protocol with comprehensive support for modern web communication features.
+A comprehensive HTTP/2 protocol implementation for Julia, providing both client and server functionality with full support for HTTP/2 features including multiplexing, flow control, header compression, and connection management.
 
 ## Features
 
-### Core HTTP/2 Protocol Support
-- **Full HTTP/2 Specification Compliance** - Complete implementation of RFC 7540
-- **Multiplexing** - Handle multiple concurrent requests over a single connection
-- **Stream Priority** - Configurable request prioritization for optimal resource delivery
-- **Flow Control** - Automatic window management for efficient data transfer
-- **Header Compression** - HPACK implementation for reduced bandwidth usage
-
-### Advanced Capabilities
-- **Server Push** - Proactively send resources to clients before they're requested
-- **TLS/SSL Support** - Secure connections with configurable certificate management
-- **Graceful Shutdown** - Clean connection termination with GOAWAY frame handling
-- **Connection Management** - Automatic connection pooling and lifecycle management
-- **Error Handling** - Comprehensive error recovery and protocol violation detection
-
-### Performance & Reliability
-- **Asynchronous I/O** - Non-blocking operations for maximum throughput
-- **Concurrent Request Handling** - Efficient multiplexing with Julia's task system
-- **Memory Efficient** - Optimized buffer management and resource utilization
-- **Robust Testing** - Comprehensive end-to-end test suite covering edge cases
+- **Full HTTP/2 Protocol Support**: Complete implementation of RFC 7540
+- **Client and Server Modes**: Configurable for both client-side and server-side operations
+- **Stream Management**: Full support for HTTP/2 multiplexed streams
+- **Header Compression**: HPACK (HTTP/2 Header Compression) support via integrated HPACK.jl
+- **Flow Control**: Automatic window management and flow control mechanisms
+- **Priority Handling**: Stream priority and dependency management
+- **Informational Responses**: Support for 1xx status codes (100 Continue, 103 Early Hints)
+- **HTTP/1.1 Upgrade**: h2c (HTTP/2 over cleartext) upgrade support
+- **Event-Driven Architecture**: Comprehensive event system for connection lifecycle management
 
 ## Installation
 
@@ -31,163 +21,185 @@ using Pkg
 Pkg.add("H2")
 ```
 
+## Dependencies
+
+- `H2Frames.jl` - HTTP/2 frame serialization and deserialization
+- `HPACK.jl` - Header compression implementation
+- `Base64.jl` - Base64 encoding for HTTP/2 settings
+
 ## Quick Start
 
-### Basic HTTP/2 Server
-
-```julia
-using H2
-using HTTP
-
-# Create a simple router
-router = HTTP.Router()
-HTTP.register!(router, "GET", "/", req -> HTTP.Response(200, "Hello, HTTP/2!"))
-
-# Start HTTP/2 server
-H2.serve(H2Router(router), "127.0.0.1", 8080)
-```
-
-### HTTP/2 Client
+### Client Usage
 
 ```julia
 using H2
 
-# Connect to HTTP/2 server
-client = H2.connect("httpbin.org", 443; is_tls=true)
+# Create a client connection
+config = H2.H2Config(client_side=true)
+client_conn = H2.H2Connection(config=config)
 
-# Make requests
-response = H2.request(client, "GET", "/get")
-println(String(response.body))
+# Initiate the connection
+H2.initiate_connection!(client_conn)
 
-# Clean up
-H2.close(client)
+# Send a request
+headers = [":method" => "GET", ":path" => "/", ":authority" => "example.com", ":scheme" => "https"]
+H2.send_headers(client_conn, UInt32(1), headers, end_stream=true)
+
+# Get data to send over the network
+data_to_send = H2.data_to_send(client_conn)
 ```
 
-## TLS/SSL Configuration
-
-H2.jl supports secure connections out of the box. For development and testing, you can generate self-signed certificates:
-
-### Quick Setup
-
-```bash
-# Create certificate directory
-mkdir -p ~/.mbedtls
-
-# Generate self-signed certificate (for development only)
-openssl req -x509 -newkey rsa:4096 \
-  -keyout ~/.mbedtls/key.pem \
-  -out ~/.mbedtls/cert.pem \
-  -days 365 -nodes \
-  -subj "/CN=localhost"
-
-# Set appropriate permissions
-chmod 600 ~/.mbedtls/key.pem ~/.mbedtls/cert.pem
-```
-
-### Environment Configuration
-
-```bash
-export CERT_PATH="$HOME/.mbedtls/cert.pem"
-export KEY_PATH="$HOME/.mbedtls/key.pem"
-```
-
-### Programmatic Configuration
+### Server Usage
 
 ```julia
-# Custom certificate paths
-cert_path = get(ENV, "CERT_PATH", joinpath(homedir(), ".mbedtls", "cert.pem"))
-key_path = get(ENV, "KEY_PATH", joinpath(homedir(), ".mbedtls", "key.pem"))
+using H2
 
-# Start secure server
-H2.serve(handler, "127.0.0.1", 8443; 
-         is_tls=true, 
-         cert_file=cert_path, 
-         key_file=key_path)
-```
+# Create a server connection
+config = H2.H2Config(client_side=false)
+server_conn = H2.H2Connection(config=config)
 
-## Advanced Usage
+# Process incoming data
+events = H2.receive_data!(server_conn, incoming_bytes)
 
-### Server Push Example
-
-```julia
-HTTP.register!(router, "GET", "/push-example", req -> begin
-    # Push CSS resource before client requests it
-    stream = req.context[:stream]
-    push_headers = [
-        ":method" => "GET",
-        ":scheme" => "https",
-        ":authority" => "example.com",
-        ":path" => "/styles.css"
-    ]
-    
-    pushed_stream = push_promise!(stream.connection, stream, push_headers)
-    
-    if pushed_stream !== nothing
-        # Send the pushed resource
-        css_content = "body { background: blue; }"
-        H2.Connection.send_headers!(pushed_stream, [":status" => "200"], end_stream=false)
-        H2.Connection.send_data!(pushed_stream, Vector{UInt8}(css_content), end_stream=true)
+# Handle events
+for event in events
+    if event isa H2.Events.RequestReceived
+        # Process the request
+        response_headers = [":status" => "200", "content-type" => "text/html"]
+        H2.send_headers(server_conn, event.stream_id, response_headers)
+        H2.send_data(server_conn, event.stream_id, Vector{UInt8}("Hello, World!"), end_stream=true)
     end
-    
-    return HTTP.Response(200, "<html><head><link rel='stylesheet' href='/styles.css'></head></html>")
-end)
-```
-
-### Custom Settings
-
-```julia
-# Configure HTTP/2 settings
-settings = H2.H2Settings.create_server_settings()
-settings.max_concurrent_streams = 100
-settings.initial_window_size = 65536
-settings.enable_push = true
-
-# Start server with custom settings
-H2.serve(handler, "127.0.0.1", 8080; settings=settings)
-```
-
-### Connection Multiplexing
-
-```julia
-# Multiple concurrent requests over single connection
-client = H2.connect("api.example.com", 443; is_tls=true)
-
-# Launch concurrent requests
-tasks = []
-for i in 1:10
-    task = @async H2.request(client, "GET", "/data/$i")
-    push!(tasks, task)
 end
 
-# Collect results
-responses = fetch.(tasks)
+# Get response data to send
+response_data = H2.data_to_send(server_conn)
 ```
 
-## Performance Characteristics
+## Core Components
 
-H2.jl is designed for high-performance scenarios:
+### H2Connection
 
-- **Low Latency** - Minimal overhead for request processing
-- **High Concurrency** - Efficient handling of thousands of concurrent streams
-- **Memory Efficient** - Optimized for large-scale deployments
-- **Protocol Compliance** - Full HTTP/2 specification adherence ensures compatibility
+The main connection object that manages HTTP/2 state:
+
+```julia
+config = H2.H2Config(client_side=true)  # or false for server
+conn = H2.H2Connection(config=config)
+```
+
+### Configuration Options
+
+- `client_side`: Boolean indicating client (true) or server (false) mode
+- Various HTTP/2 settings can be configured through the connection
+
+### Event System
+
+H2.jl uses an event-driven architecture. Key events include:
+
+- `H2.Events.RequestReceived` - New request received
+- `H2.Events.ResponseReceived` - Response received
+- `H2.Events.DataReceived` - Data frame received
+- `H2.Events.StreamEnded` - Stream completed
+- `H2.Events.SettingsChanged` - Settings frame processed
+- `H2.Events.PriorityChanged` - Priority frame received
+- `H2.Events.StreamReset` - Stream reset
+- `H2.Events.ConnectionTerminated` - Connection closed
+- `H2.Events.PingReceived` - Ping frame received
+- `H2.Events.PingAck` - Ping acknowledgment received
+- `H2.Events.InformationalResponseReceived` - 1xx response received
+- `H2.Events.H2CUpgradeReceived` - HTTP/1.1 to HTTP/2 upgrade
+
+## Advanced Features
+
+### Stream Priority
+
+```julia
+# Set stream priority
+H2.prioritize!(conn, stream_id; weight=128, depends_on=parent_stream_id, exclusive=false)
+
+# Send headers with priority information
+H2.send_headers(conn, stream_id, headers; 
+                priority_weight=128, 
+                priority_depends_on=parent_stream_id, 
+                priority_exclusive=false)
+```
+
+### Flow Control
+
+```julia
+# Acknowledge received data to update flow control windows
+H2.acknowledge_received_data!(conn, stream_id, bytes_consumed)
+```
+
+### Informational Responses
+
+```julia
+# Send 1xx responses (server-side)
+informational_headers = [":status" => "103", "link" => "</style.css>; rel=preload; as=style"]
+H2.send_headers(conn, stream_id, informational_headers, end_stream=false)
+
+# Send final response
+final_headers = [":status" => "200", "content-type" => "text/html"]
+H2.send_headers(conn, stream_id, final_headers, end_stream=true)
+```
+
+### HTTP/1.1 to HTTP/2 Upgrade (h2c)
+
+```julia
+# Server handles HTTP/1.1 upgrade requests automatically
+# Client can initiate upgrade by sending appropriate HTTP/1.1 headers
+```
+
+## Error Handling
+
+The library provides comprehensive error handling:
+
+- `H2.H2Exceptions.ProtocolError` - Protocol violations
+- `ArgumentError` - Invalid parameters (e.g., invalid priority weights)
+
+## Flow Control Details
+
+H2.jl implements automatic flow control management:
+
+- **Window Management**: Automatic tracking of connection and stream-level flow control windows
+- **Window Updates**: Automatic generation of WINDOW_UPDATE frames when appropriate
+- **Backpressure**: Proper handling of flow control constraints
 
 ## Testing
 
-Run the comprehensive test suite:
+The library includes comprehensive tests covering:
+
+- Connection establishment and teardown
+- Request/response cycles
+- Stream multiplexing
+- Flow control mechanisms
+- Priority handling
+- Error conditions
+- HTTP/1.1 upgrade scenarios
+
+Run tests with:
 
 ```julia
 using Pkg
 Pkg.test("H2")
 ```
 
-The test suite includes:
-- Protocol compliance verification
-- Multiplexing and concurrency tests
-- Server push functionality
-- Flow control validation
-- Error handling scenarios
-- Performance benchmarks
+## Protocol Compliance
+
+H2.jl aims for full RFC 7540 compliance, including:
+
+- Connection preface handling
+- Frame format compliance
+- HPACK header compression
+- Stream state management
+- Flow control algorithms
+- Error handling and recovery
+
+## Performance Considerations
+
+- Efficient frame parsing and serialization
+- Minimal memory allocations during normal operation
+- Proper resource cleanup and stream lifecycle management
+- Optimized HPACK compression/decompression
 
 ## Contributing
 

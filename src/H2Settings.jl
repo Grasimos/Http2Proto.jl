@@ -1,240 +1,252 @@
+"""
+    H2Settings
+
+HTTP/2 settings management for connection configuration.
+
+This module provides functionality for managing HTTP/2 connection settings,
+including tracking setting changes, acknowledgments, and maintaining both
+current and pending setting values as specified in RFC 7540.
+"""
 module H2Settings
 
+using ..H2Exceptions
+using ..H2Errors
+using H2Frames.FrameTypes
+using DataStructures
 
-using Base: @kwdef
-using H2Frames: SettingsFrame, SettingsParameter,
-                SETTINGS_HEADER_TABLE_SIZE, SETTINGS_ENABLE_PUSH,
-                SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_INITIAL_WINDOW_SIZE,
-                SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
-                SETTINGS_ENABLE_CONNECT_PROTOCOL
-using ..Exc
-
-export HTTP2Settings, create_server_settings, create_client_settings, create_settings_frame,
-    DEFAULT_HEADER_TABLE_SIZE, DEFAULT_WINDOW_SIZE, DEFAULT_MAX_FRAME_SIZE, SETTINGS_ACK, apply_settings!
-
-const DEFAULT_WINDOW_SIZE = 65535  # 2^16 - 1
-const DEFAULT_HEADER_TABLE_SIZE = 4096
-const DEFAULT_MAX_FRAME_SIZE = 16384  # 2^14
-const SETTINGS_ACK = 0x1
+export Settings, ChangedSetting
 
 """
-    HTTP2Settings
+    ChangedSetting
 
-Structure representing HTTP/2 connection settings as defined in RFC 7540.
-Contains both local and remote settings with proper validation.
+Represents a setting that has changed and is awaiting acknowledgment.
+
+This struct tracks the transition of a setting value from its original
+value to a new value, which is useful for implementing the HTTP/2 settings
+acknowledgment mechanism.
+
+# Fields
+- `setting::SettingsParameter`: The setting parameter that changed
+- `original_value::Union{UInt32, Nothing}`: The previous value (Nothing if this is the first value)
+- `new_value::UInt32`: The new value that was set
+
+# Examples
+```julia
+julia> changed = ChangedSetting(SETTINGS_MAX_FRAME_SIZE, UInt32(16384), UInt32(32768))
+ChangedSetting(SETTINGS_MAX_FRAME_SIZE, 0x00004000, 0x00008000)
+```
 """
-@kwdef mutable struct HTTP2Settings
-    stream_id::UInt32 = UInt32(0)
-    header_table_size::UInt32 = DEFAULT_HEADER_TABLE_SIZE
-    enable_push::Bool = true
-    max_concurrent_streams::UInt32 = typemax(UInt32)
-    initial_window_size::UInt32 = DEFAULT_WINDOW_SIZE
-    max_frame_size::UInt32 = DEFAULT_MAX_FRAME_SIZE
-    max_header_list_size::UInt32 = typemax(UInt32)
-    enable_connect_protocol::Bool = false
+struct ChangedSetting
+    setting::SettingsParameter
+    original_value::Union{UInt32, Nothing}
+    new_value::UInt32
 end
 
-function validate_http2_settings!(settings::HTTP2Settings)
-    # Validate according to RFC 7540
-    settings.initial_window_size > 2147483647 && throw(FlowControlError("SETTINGS_INITIAL_WINDOW_SIZE must not exceed 2^31-1"))
-    !(16384 ≤ settings.max_frame_size ≤ 16777215) && throw(ProtocolError("SETTINGS_MAX_FRAME_SIZE must be between 2^14 and 2^24-1"))
-    return settings
-end
+"""
+    Settings
 
-function HTTP2Settings(args...; kwargs...)
-    settings = HTTP2Settings(args...; kwargs...)
-    return validate_http2_settings!(settings)
+HTTP/2 settings management with support for pending acknowledgments.
+
+The Settings struct manages HTTP/2 connection settings according to RFC 7540.
+It maintains a queue of values for each setting to handle the case where
+settings are changed before they are acknowledged by the peer.
+
+Key features:
+- Implements Dict-like interface for easy access
+- Tracks pending setting changes until acknowledgment
+- Handles client/server differences (e.g., SETTINGS_ENABLE_PUSH)
+- Maintains setting history for proper acknowledgment handling
+
+# Fields
+- `_settings::Dict{SettingsParameter, Deque{UInt32}}`: Internal storage with queued values
+
+# Examples
+```julia
+julia> settings = Settings(client=true)
+Settings(...)
+
+julia> settings[SETTINGS_MAX_FRAME_SIZE]
+0x00004000
+
+julia> settings[SETTINGS_MAX_FRAME_SIZE] = UInt32(32768)
+julia> changed = acknowledge(settings)
+```
+"""
+mutable struct Settings
+    _settings::Dict{SettingsParameter, Deque{UInt32}}
+    
+    function Settings(; client::Bool, initial_values::Dict{SettingsParameter, UInt32}=Dict{SettingsParameter, UInt32}())
+        defaults = copy(DEFAULT_SETTINGS)
+        defaults[SETTINGS_ENABLE_PUSH] = client ? 1 : 0
+        
+        merge!(defaults, initial_values)
+        
+        internal_dict = Dict{SettingsParameter, Deque{UInt32}}()
+        for (k, v) in defaults
+            internal_dict[k] = Deque{UInt32}()
+            push!(internal_dict[k], v)
+        end
+        
+        new(internal_dict)
+    end
 end
 
 
 """
-    apply_settings!(settings::HTTP2Settings, frame::SettingsFrame)
+    Base.getindex(s::Settings, key::SettingsParameter) -> UInt32
 
-Updates the `settings` object with parameters from an incoming SETTINGS frame.
-Performs validation for each parameter. Ignores ACK frames.
+Get the current value of a setting.
+
+Returns the most recent (current) value for the given setting parameter.
+If there are pending changes, this returns the pending value.
+
+# Arguments
+- `s::Settings`: The settings object
+- `key::SettingsParameter`: The setting parameter to retrieve
+
+# Returns
+- `UInt32`: The current value of the setting
+
+# Examples
+```julia
+julia> settings = Settings(client=true)
+julia> settings[SETTINGS_MAX_FRAME_SIZE]
+0x00004000
+```
 """
-function apply_settings!(settings::HTTP2Settings, frame::SettingsFrame)
-    frame.ack && return  
+function Base.getindex(s::Settings, key::SettingsParameter)
+    return first(s._settings[key])
+end
 
-    for (param_id, value) in frame.parameters
-        param_enum = SettingsParameter(param_id)
-        if param_enum == SETTINGS_HEADER_TABLE_SIZE
-            settings.header_table_size = UInt32(value)
-        elseif param_enum == SETTINGS_ENABLE_PUSH
-            (value != 0 && value != 1) && throw(ProtocolError("SETTINGS_ENABLE_PUSH must be 0 or 1"))
-            settings.enable_push = (value == 1)
-        elseif param_enum == SETTINGS_MAX_CONCURRENT_STREAMS
-            settings.max_concurrent_streams = UInt32(value)
-        elseif param_enum == SETTINGS_INITIAL_WINDOW_SIZE
-            value > 2147483647 && throw(FlowControlError("SETTINGS_INITIAL_WINDOW_SIZE must not exceed 2^31-1"))
-            settings.initial_window_size = UInt32(value)
-        elseif param_enum == SETTINGS_MAX_FRAME_SIZE
-            !(16384 ≤ value ≤ 16777215) && throw(ProtocolError("SETTINGS_MAX_FRAME_SIZE must be between 2^14 and 2^24-1"))
-            settings.max_frame_size = UInt32(value)
-        elseif param_enum == SETTINGS_MAX_HEADER_LIST_SIZE
-            settings.max_header_list_size = UInt32(value)
-        elseif param_enum == SETTINGS_ENABLE_CONNECT_PROTOCOL
-            (value != 0 && value != 1) && throw(ProtocolError("SETTINGS_ENABLE_CONNECT_PROTOCOL must be 0 or 1"))
-            settings.enable_connect_protocol = (value == 1)
+"""
+    Base.setindex!(s::Settings, value::UInt32, key::SettingsParameter)
+
+Set a new value for a setting.
+
+This adds a new value to the setting's queue. The new value becomes the
+current value, but the old value is preserved until acknowledgment.
+
+# Arguments
+- `s::Settings`: The settings object
+- `value::UInt32`: The new value to set
+- `key::SettingsParameter`: The setting parameter to modify
+
+# Examples
+```julia
+julia> settings = Settings(client=true)
+julia> settings[SETTINGS_MAX_FRAME_SIZE] = UInt32(32768)
+```
+"""
+function Base.setindex!(s::Settings, value::UInt32, key::SettingsParameter)
+    if !haskey(s._settings, key)
+        s._settings[key] = Deque{UInt32}()
+    end
+    empty!(s._settings[key])
+    push!(s._settings[key], value)
+end
+
+"""
+    Base.haskey(s::Settings, key::SettingsParameter) -> Bool
+
+Check if a setting parameter exists.
+
+# Arguments
+- `s::Settings`: The settings object
+- `key::SettingsParameter`: The setting parameter to check
+
+# Returns
+- `Bool`: true if the setting exists, false otherwise
+"""
+Base.haskey(s::Settings, key::SettingsParameter) = haskey(s._settings, key)
+
+"""
+    Base.get(s::Settings, key::SettingsParameter, default) -> Union{UInt32, typeof(default)}
+
+Get a setting value with a default fallback.
+
+# Arguments
+- `s::Settings`: The settings object
+- `key::SettingsParameter`: The setting parameter to retrieve
+- `default`: The default value to return if the setting doesn't exist
+
+# Returns
+- The setting value if it exists, otherwise the default value
+"""
+function Base.get(s::Settings, key::SettingsParameter, default)
+    return haskey(s, key) ? s[key] : default
+end
+
+"""
+    Base.iterate(s::Settings, state...) -> Union{Tuple, Nothing}
+
+Iterate over all settings as key-value pairs.
+
+This allows the Settings object to be used in for loops and other
+iteration contexts.
+
+# Arguments
+- `s::Settings`: The settings object
+- `state...`: Iterator state (internal use)
+
+# Returns
+- `Tuple{Pair{SettingsParameter, UInt32}, Any}`: Next key-value pair and state
+- `Nothing`: If iteration is complete
+"""
+function Base.iterate(s::Settings, state...)
+    iter_result = iterate(s._settings, state...)
+    isnothing(iter_result) && return nothing
+    
+    (pair, next_state) = iter_result
+    return (pair.first => first(pair.second), next_state)
+end
+
+"""
+    Base.length(s::Settings) -> Int
+
+Get the number of settings.
+
+# Arguments
+- `s::Settings`: The settings object
+
+# Returns
+- `Int`: The number of settings
+"""
+Base.length(s::Settings) = length(s._settings)
+
+"""
+    acknowledge(s::Settings) -> Dict{SettingsParameter, ChangedSetting}
+
+Acknowledge pending setting changes.
+
+This function should be called when a SETTINGS acknowledgment frame is received.
+It processes all pending setting changes and returns information about what
+settings were changed.
+
+# Arguments
+- `s::Settings`: The settings object
+
+# Returns
+- `Dict{SettingsParameter, ChangedSetting}`: Map of changed settings with their old and new values
+
+# Examples
+```julia
+julia> settings = Settings(client=true)
+julia> settings[SETTINGS_MAX_FRAME_SIZE] = UInt32(32768)
+julia> changed = acknowledge(settings)
+julia> haskey(changed, SETTINGS_MAX_FRAME_SIZE)
+true
+```
+"""
+function acknowledge(s::Settings)::Dict{SettingsParameter, ChangedSetting}
+    changed = Dict{SettingsParameter, ChangedSetting}()
+    for (key, values) in s._settings
+        if length(values) > 1
+            original_value = popfirst!(values)
+            new_value = first(values)
+            changed[key] = ChangedSetting(key, original_value, new_value)
         end
     end
+    return changed
 end
 
-"""
-    copy(settings::HTTP2Settings) -> HTTP2Settings
-
-Create a copy of HTTP/2 settings.
-"""
-function Base.copy(settings::HTTP2Settings)
-    new_settings = HTTP2Settings(stream_id=settings.stream_id)
-    new_settings.header_table_size = settings.header_table_size
-    new_settings.enable_push = settings.enable_push
-    new_settings.max_concurrent_streams = settings.max_concurrent_streams
-    new_settings.initial_window_size = settings.initial_window_size
-    new_settings.max_frame_size = settings.max_frame_size
-    new_settings.max_header_list_size = settings.max_header_list_size
-    new_settings.enable_connect_protocol = settings.enable_connect_protocol
-    return new_settings
-end
-
-"""
-    validate_settings(settings::HTTP2Settings) -> Bool
-
-Validate that all settings values are within acceptable ranges according to RFC 7540.
-Throws HTTP2Error if any setting is invalid.
-"""
-function validate_settings(settings::HTTP2Settings)
-    if settings.initial_window_size > MAX_WINDOW_SIZE
-        throw(FlowControlError("SETTINGS_INITIAL_WINDOW_SIZE ($(settings.initial_window_size)) exceeds maximum ($(MAX_WINDOW_SIZE))"))
-    end
-    
-    if settings.max_frame_size < SETTINGS_MAX_FRAME_SIZE_MIN || settings.max_frame_size > SETTINGS_MAX_FRAME_SIZE_MAX
-        throw(ProtocolError("SETTINGS_MAX_FRAME_SIZE ($(settings.max_frame_size)) must be between $(SETTINGS_MAX_FRAME_SIZE_MIN) and $(SETTINGS_MAX_FRAME_SIZE_MAX)"))
-    end
-    
-    return true
-end
-
-"""
-    settings_to_dict(settings::HTTP2Settings) -> Dict{UInt16, UInt32}
-
-Convert HTTP2Settings to a dictionary for transmission in SETTINGS frame.
-Only includes non-default values to minimize frame size.
-"""
-function settings_to_dict(settings::HTTP2Settings)
-    dict = Dict{UInt16, UInt32}()
-    dict[UInt16(SETTINGS_HEADER_TABLE_SIZE)] = settings.header_table_size
-    dict[UInt16(SETTINGS_ENABLE_PUSH)] = settings.enable_push ? 1 : 0
-    dict[UInt16(SETTINGS_MAX_CONCURRENT_STREAMS)] = settings.max_concurrent_streams
-    dict[UInt16(SETTINGS_INITIAL_WINDOW_SIZE)] = settings.initial_window_size
-    dict[UInt16(SETTINGS_MAX_FRAME_SIZE)] = settings.max_frame_size
-    dict[UInt16(SETTINGS_MAX_HEADER_LIST_SIZE)] = settings.max_header_list_size
-    dict[UInt16(SETTINGS_ENABLE_CONNECT_PROTOCOL)] = settings.enable_connect_protocol ? 1 : 0
-    return dict
-end
-
-
-
-"""
-    apply_setting!(settings::HTTP2Settings, setting_id::UInt16, value::UInt32)
-
-Apply a single setting value. Validates the setting before applying.
-"""
-
-
-function apply_setting!(settings::HTTP2Settings, setting_id::UInt16, value::UInt32)
-    # Centralized validation call. This is the core of the refactoring.
-    Validation.validate_settings_value(setting_id, value)
-
-    # Apply the setting without redundant checks.
-    if setting_id == UInt16(SETTINGS_HEADER_TABLE_SIZE)
-        settings.header_table_size = value
-    elseif setting_id == UInt16(SETTINGS_ENABLE_PUSH)
-        settings.enable_push = (value == 1)
-    elseif setting_id == UInt16(SETTINGS_MAX_CONCURRENT_STREAMS)
-        settings.max_concurrent_streams = value
-    elseif setting_id == UInt16(SETTINGS_INITIAL_WINDOW_SIZE)
-        settings.initial_window_size = value
-    elseif setting_id == UInt16(SETTINGS_MAX_FRAME_SIZE)
-        settings.max_frame_size = value
-    elseif setting_id == UInt16(SETTINGS_MAX_HEADER_LIST_SIZE)
-        settings.max_header_list_size = value
-    elseif setting_id == UInt16(SETTINGS_ENABLE_CONNECT_PROTOCOL)
-        settings.enable_connect_protocol = (value == 1)
-    else
-        # Per RFC 7540, Section 6.5.2: An endpoint that receives a SETTINGS frame with any
-        # unknown parameter MUST ignore that parameter.
-        @debug "Ignoring unknown setting ID: $setting_id"
-    end
-end
-
-"""
-    create_settings_frame(settings::HTTP2Settings; ack::Bool = false) -> SettingsFrame
-
-Create a SETTINGS frame from HTTP2Settings.
-"""
-function create_settings_frame(settings::HTTP2Settings; ack::Bool = false)
-    if ack
-        # ACK frames have empty payload
-        return SettingsFrame(Dict{UInt16, UInt32}(); ack=true)
-    else
-        settings_dict = settings_to_dict(settings)
-        return SettingsFrame(settings_dict; ack=false)
-    end
-end
-
-
-"""
-    get_effective_max_frame_size(local_settings::HTTP2Settings, remote_settings::HTTP2Settings) -> UInt32
-
-Get the effective maximum frame size that can be sent, which is the minimum of 
-local max frame size and remote max frame size.
-"""
-function get_effective_max_frame_size(local_settings::HTTP2Settings, remote_settings::HTTP2Settings)
-    return min(local_settings.max_frame_size, remote_settings.max_frame_size)
-end
-
-
-"""
-    Base.show(io::IO, settings::HTTP2Settings)
-
-Pretty print HTTP2Settings for debugging.
-"""
-function Base.show(io::IO, settings::HTTP2Settings)
-    @info (io, "HTTP2Settings:")
-    @info (io, "  Header Table Size: $(settings.header_table_size)")
-    @info (io, "  Enable Push: $(settings.enable_push)")
-    @info (io, "  Max Concurrent Streams: $(settings.max_concurrent_streams)")
-    @info (io, "  Initial Window Size: $(settings.initial_window_size)")
-    @info (io, "  Max Frame Size: $(settings.max_frame_size)")
-    @info (io, "  Max Header List Size: $(settings.max_header_list_size)")
-    @info (io, "  Enable Connect Protocol: $(settings.enable_connect_protocol)")
-end
-
-"""
-    create_client_settings() -> HTTP2Settings
-
-Create default settings appropriate for an HTTP/2 client.
-"""
-function create_client_settings()
-    settings = HTTP2Settings()
-    settings.enable_push = false
-    settings.max_concurrent_streams = 100
-    settings.max_header_list_size = 8192
-    return settings
-end
-
-"""
-    create_server_settings() -> HTTP2Settings
-
-Create default settings appropriate for an HTTP/2 server.
-"""
-function create_server_settings(; max_concurrent_streams::Integer = 1000)::HTTP2Settings
-    settings = HTTP2Settings()
-    settings.enable_push = true
-    settings.max_concurrent_streams = UInt32(max_concurrent_streams) 
-    settings.max_header_list_size = 16384
-    settings.max_frame_size = 32768
-    return settings
-end
 end

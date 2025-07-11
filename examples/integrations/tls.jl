@@ -1,5 +1,3 @@
-# [THE CORRECT API FIX] H2/src/integrations/tls.jl
-
 module H2TLSIntegration
 
 using Sockets

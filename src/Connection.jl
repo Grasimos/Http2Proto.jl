@@ -1,1361 +1,1413 @@
 module Connection
-# src/connection/connection.jl
 
-using H2Frames: HTTP2Frame, RstStreamFrame, HeadersFrame, DataFrame, ContinuationFrame, WindowUpdateFrame, GoAwayFrame, PingFrame, PushPromiseFrame, SettingsFrame, PriorityFrame, serialize_payload, serialize_frame, stream_id
-using HPACK
+using ..Events
+using ..H2Exceptions 
+using ..H2Errors
+using ..H2Windows
+using ..Config
+using ..H2Settings
+
 using H2Frames
-using DataStructures
-using Base.Threads: threadid
+using HPACK
+using Logging
+using Base64
 
 
-using ..Exc: ProtocolError, HTTP2Exception, exception_to_error_code
-using ..H2Types, ..H2Settings, ..Exc, ..Streams, ....RateLimiter 
+export H2Connection, H2Stream, receive_data!, send_headers, send_data, 
+data_to_send, send_settings, acknowledge_received_data!, initiate_connection!, prioritize!
 
+const CONNECTION_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
+"""
+    H2Stream
 
-export is_client, is_server, next_stream_id, add_stream, get_stream, remove_stream,
-       send_preface!, receive_preface!, process_received_frame, process_connection_frame,
-       apply_settings, close_connection!, ping, update_window, create_client_stream!, send_goaway!, update_send_window!,
-    consume_receive_window!, replenish_receive_window!, update_all_stream_send_windows!, send_headers!, send_data!,
-    receive_headers!, receive_data!
+Represents an individual HTTP/2 stream within a connection.
 
+# Fields
+- `stream_id::UInt32`: The unique identifier for the stream (consistent with Events module)
+- `state::Symbol`: Current state of the stream (`:idle`, `:open`, `:half_closed_local`, `:half_closed_remote`, `:closed`)
+- `send_window::UInt32`: Flow control window for sending data
+- `inbound_window_manager::WindowManager`: Manages the receive window
+- `priority::Union{Events.Priority, Nothing}`: Stream priority information
 
-function send_loop(mux::StreamMultiplexer)
-    role = is_client(mux.conn) ? "CLIENT" : "SERVER" 
-    @debug "[$role][T$(threadid())] SendLoop: Starting."
-    try 
-        while !is_closed(mux.conn)
-            local item_to_send::Union{HTTP2Frame, CleanupStream, Nothing} = nothing
-            local stream_id_to_process::Union{UInt32, Nothing} = nothing
-            
-            @lock mux.send_lock begin
-                while isempty(mux.pending_streams) && !is_closed(mux.conn)
-                    @debug "[$role][T$(threadid())] SendLoop: Queue empty, waiting on condition..."
-                    wait(mux.send_condition)
-                end
+# Usage
+```julia
+# Create a new stream
+stream = H2Stream(UInt32(1))
 
-                if is_closed(mux.conn)
-                    break
-                end
-                
-                pair = dequeue_pair!(mux.pending_streams)
-                stream_id_to_process = pair.first
-                priority = pair.second
-                
-                channel = get(mux.frame_channels, stream_id_to_process, nothing)
-                
-                if channel !== nothing && isready(channel)
-                    item_to_send = take!(channel)
-                    if isopen(channel) && isready(channel)
-                        enqueue!(mux.pending_streams, stream_id_to_process, priority)
-                    end
-                end
-            end 
+# Create with custom settings
+stream = H2Stream(
+    UInt32(3), 
+    :open, 
+    UInt32(32768),  # send window
+    UInt32(65535),  # receive window
+    Events.Priority(UInt32(0), UInt8(16), false)  # priority
+)
 
-            if item_to_send isa HTTP2Frame
-                @debug "[$role][T$(threadid())] SendLoop: Sending frame $(item_to_send)" 
-                try
-                    send_frame(mux.conn, serialize_frame(item_to_send))
-                catch e
-                    @error "[$role][T$(threadid())] SendLoop: Socket write error." exception=(e, catch_backtrace()) 
-                    handle_connection_error!(mux.conn, :INTERNAL_ERROR, "Socket write failure")
-                    break
-                end
-            elseif item_to_send isa CleanupStream
-                @debug "[$role][T$(threadid())] SendLoop: Cleaning up stream $(stream_id_to_process)."
-                @lock mux.send_lock begin
-                    delete!(mux.conn.streams, stream_id_to_process)
-                    channel_to_close = pop!(mux.frame_channels, stream_id_to_process, nothing)
-                    if channel_to_close !== nothing && isopen(channel_to_close)
-                        close(channel_to_close)
-                    end
-                end
-            end
-           
-            yield()
-        end
-    catch ex
-        if !(ex isa InvalidStateException)
-            @error "[$role][T$(threadid())] SendLoop: Unhandled exception." exception=(ex, catch_backtrace())
-        end
-    finally
-        @debug "[$role][T$(threadid())] SendLoop: Shutdown."
-    end
-end
-
-function send_headers!(stream::HTTP2Stream, headers::Vector{<:Pair{<:AbstractString, <:AbstractString}}; end_stream::Bool=false)
-    role = stream.connection.role
-    @debug "[$role][T$(threadid())] Stream $(stream.id): Queueing HEADERS" headers=headers end_stream=end_stream
-
-    final_headers = [lowercase(String(k)) => String(v) for (k, v) in headers]
-
-    # Lock the stream only to perform the state transition
-    @lock stream.lock begin
-        transition_stream_state!(stream, :send_headers)
-        if end_stream
-            transition_stream_state!(stream, :send_end_stream)
-        end
-    end
-
-    # HPACK encoding can happen outside the lock. The send_loop will serialize it.
-    header_block = HPACK.encode_headers(stream.connection.hpack_encoder, final_headers)
-    frame = HeadersFrame(stream.id, header_block; end_stream=end_stream)
-
-    # Correctly queue the frame for the multiplexer's send_loop
-    send_frame_on_stream(stream.connection.multiplexer, stream.id, frame)
+# Access stream properties
+println("Stream ID: ", stream.stream_id)
+println("State: ", stream.state)
+println("Send window: ", stream.send_window)
+```
+"""
+mutable struct H2Stream
+    stream_id::UInt32 
+    state::Symbol
+    send_window::UInt32
+    inbound_window_manager::WindowManager
+    priority::Union{Events.Priority, Nothing}
     
-    @debug "[$role][T$(threadid())] Stream $(stream.id): HEADERS frame queued."
-end
-
-function send_data!(stream::HTTP2Stream, data::Vector{UInt8}; end_stream::Bool=false)
-    role = is_client(stream.connection) ? "CLIENT" : "SERVER"
-    @debug "[$role][T$(threadid())] Stream $(stream.id): Queueing DATA" bytes=length(data) end_stream=end_stream
-
-    # Lock the stream only to perform the state transition
-    @lock stream.lock begin
-        transition_stream_state!(stream, :send_data)
-    end
-    
-    max_frame_size = Int(stream.connection.remote_settings.max_frame_size)
-    frames_to_send = create_data_frame(stream.id, data; end_stream=false, max_frame_size=max_frame_size)
-
-    if isempty(frames_to_send) && end_stream
-        empty_frame = DataFrame(stream.id, UInt8[]; end_stream=true)
-        send_frame_on_stream(stream.connection.multiplexer, stream.id, empty_frame)
-    else
-        # Queue each DATA frame for the send_loop
-        for (i, frame) in enumerate(frames_to_send)
-            is_last_frame = (i == length(frames_to_send))
-            final_end_stream = is_last_frame && end_stream
-            
-            final_frame = DataFrame(frame.stream_id, frame.data; end_stream=final_end_stream)
-            send_frame_on_stream(stream.connection.multiplexer, stream.id, final_frame)
-        end
-    end
-
-    if end_stream
-        # Lock the stream again only for the final state transition
-        @lock stream.lock begin
-            transition_stream_state!(stream, :send_end_stream)
-        end
-    end
-end
-
-
-function receive_headers!(stream::HTTP2Stream, headers::Vector{<:Pair{<:AbstractString, <:AbstractString}}; end_stream::Bool=false)
-    role = is_client(stream.connection) ? "CLIENT" : "SERVER"
-    @debug "[$role][T$(threadid())] Stream $(stream.id): Receiving HEADERS, acquiring lock..."
-    
-    @lock stream.lock begin
-        @debug "[$role][T$(threadid())] Stream $(stream.id): Acquired lock. Setting headers."
-        stream.headers = headers
-        transition_stream_state!(stream, :recv_headers)
-        if end_stream
-            @debug "[$role][T$(threadid())] Stream $(stream.id): END_STREAM flag received with headers."
-            stream.end_stream_received = true
-        end
-        @debug "[$role][T$(threadid())] Stream $(stream.id): Notifying headers_available (inside lock)."
-        notify(stream.headers_available; all=true)
-        @debug "[$role][T$(threadid())] Stream $(stream.id): Releasing lock after notify."
-    end
-    update_activity!(stream)
-end
-
-
-
-function receive_data!(stream::HTTP2Stream, data::Vector{UInt8}; end_stream::Bool=false)
-    role = is_client(stream.connection) ? "CLIENT" : "SERVER" 
-    @debug "[$role][T$(threadid())] Stream $(stream.id): Receiving DATA (bytes: $(length(data)))"
-
-    if length(data) > stream.receive_window || length(data) > stream.connection.receive_window 
-        throw(FlowControlError("Received more data than the advertised window size", stream.id))
-    end
-    
-    consume_receive_window!(stream, length(data))
-
-    @lock stream.lock begin
-        write(stream.data_buffer, data)
-        transition_stream_state!(stream, :recv_data)
-        if end_stream
-             @debug "[$role][T$(threadid())] Stream $(stream.id): END_STREAM flag received with data." 
-             stream.end_stream_received = true
-        end
-        notify(stream.data_available; all=true)
-    end
-    
-    replenish_receive_window!(stream, length(data))
-    
-    update_activity!(stream)
-end
-"""
-    next_stream_id(conn::HTTP2Connection) -> UInt32
-
-Get the next available stream ID for this connection.
-Clients use odd numbers (1, 3, 5, ...), servers use even numbers (2, 4, 6, ...).
-"""
-function next_stream_id(conn::HTTP2Connection)
-    @lock conn.streams_lock begin
-        current = conn.last_stream_id
-        conn.last_stream_id += 2  # Skip by 2 to maintain odd/even pattern
-        return current
+    function H2Stream(stream_id::UInt32, state::Symbol = :idle, 
+                     send_window::UInt32 = UInt32(65535), 
+                     receive_window::UInt32 = UInt32(65535),
+                     priority::Union{Events.Priority, Nothing} = nothing)
+        Events.validate_stream_id(stream_id)
+        new(stream_id, state, send_window, WindowManager(receive_window), priority)
     end
 end
 
 """
-    add_stream(conn::HTTP2Connection, stream::HTTP2Stream)
+    H2Connection
 
-Add a stream to the connection's stream table.
+Represents an HTTP/2 connection that manages multiple streams and connection-level state.
+
+# Fields
+- `config::H2Config`: Configuration settings for the connection
+- `hpack_encoder::HPACKEncoder`: HPACK encoder for header compression
+- `hpack_decoder::HPACKDecoder`: HPACK decoder for header decompression
+- `streams::Dict{UInt32, H2Stream}`: Dictionary of active streams (UInt32 keys for consistency)
+- `next_stream_id::UInt32`: Next stream ID to use for new streams
+- `last_processed_stream_id::UInt32`: Last processed stream ID
+- `outbound_buffer::IOBuffer`: Buffer for outgoing data
+- `inbound_buffer::IOBuffer`: Buffer for incoming data
+- `local_settings::Settings`: Local connection settings
+- `remote_settings::Settings`: Remote peer settings
+- `preface_received::Bool`: Whether the connection preface has been received
+- `send_window::UInt32`: Connection-level flow control window for sending
+- `inbound_window_manager::WindowManager`: Connection-level receive window manager
+
+# Usage
+```julia
+# Create a client connection
+client_config = H2Config(client_side=true)
+client_conn = H2Connection(config=client_config)
+
+# Create a server connection
+server_config = H2Config(client_side=false)
+server_conn = H2Connection(config=server_config)
+
+# Initialize the connection
+initiate_connection!(client_conn)
+
+# Send headers
+headers = [":method" => "GET", ":path" => "/", ":scheme" => "https"]
+send_headers(client_conn, UInt32(1), headers)
+
+# Send data
+data = Vector{UInt8}("Hello, world!")
+send_data(client_conn, UInt32(1), data, end_stream=true)
+
+# Get data to send over the network
+outbound_data = data_to_send(client_conn)
+
+# Process incoming data
+incoming_data = Vector{UInt8}([...])  # data from network
+events = receive_data!(client_conn, incoming_data)
+```
+
+# Stream Management
+```julia
+# Check stream state
+state = get_stream_state(conn, UInt32(1))
+
+# Get stream priority
+priority = get_stream_priority(conn, UInt32(1))
+
+# Set stream priority
+prioritize!(conn, UInt32(1), weight=32, depends_on=UInt32(0), exclusive=false)
+```
+
+# Flow Control
+```julia
+# Acknowledge received data to update flow control windows
+acknowledge_received_data!(conn, UInt32(1), UInt32(1024))
+```
+
+# Settings Management
+```julia
+# Send settings
+settings = Dict(:max_concurrent_streams => UInt32(200))
+send_settings(conn, settings)
+```
+
+# Connection Summary
+```julia
+# Get connection information
+summary = connection_summary(conn)
+println(summary)
+```
 """
-function add_stream(conn::HTTP2Connection, stream::HTTP2Stream)
-    @lock conn.streams_lock begin
-        conn.streams[stream.id] = stream
-        
-        if (is_client(conn) && iseven(stream.id)) || (is_server(conn) && isodd(stream.id))
-            conn.last_peer_stream_id = max(conn.last_peer_stream_id, stream.id)
-        end
+mutable struct H2Connection
+    config::H2Config
+    hpack_encoder::HPACKEncoder
+    hpack_decoder::HPACKDecoder
+    streams::Dict{UInt32, H2Stream} 
+    next_stream_id::UInt32
+    last_processed_stream_id::UInt32
+    outbound_buffer::IOBuffer
+    inbound_buffer::IOBuffer
+    local_settings::Settings
+    remote_settings::Settings
+    preface_received::Bool
+    send_window::UInt32
+    inbound_window_manager::WindowManager
+
+    function H2Connection(; config::H2Config)
+        next_stream_id = config.client_side ? UInt32(1) : UInt32(2)
+         initial_conn_settings = Dict(
+            SETTINGS_MAX_CONCURRENT_STREAMS => UInt32(100)
+        )
+        new(
+            config,
+            HPACKEncoder(),
+            HPACKDecoder(),
+            Dict{UInt32, H2Stream}(),
+            next_stream_id,
+            UInt32(0),
+            IOBuffer(),
+            IOBuffer(),
+            Settings(client=config.client_side, initial_values=initial_conn_settings),
+            Settings(client=!config.client_side),
+            false,
+            UInt32(65535),
+            WindowManager(UInt32(65535))
+        )
     end
 end
 
-"""
-    get_stream(conn::HTTP2Connection, stream_id::UInt32) -> Union{HTTP2Stream, Nothing}
-
-Get a stream by its ID, or nothing if it doesn't exist.
-"""
-function get_stream(conn::HTTP2Connection, stream_id::UInt32)
-    @lock conn.streams_lock begin
-        return get(conn.streams, stream_id, nothing)
-    end
-end
 
 """
-    remove_stream(conn::HTTP2Connection, stream_id::UInt32)
+    initiate_connection!(conn::H2Connection)
 
-Remove a stream from the connection's stream table.
+Prepares the initial data that must be sent when starting a connection 
+(preface for client and initial SETTINGS frame).
+
+# Usage
+```julia
+conn = H2Connection(config=H2Config(client_side=true))
+initiate_connection!(conn)
+data = data_to_send(conn)  # Get the preface and settings to send
+```
 """
-function remove_stream(conn::HTTP2Connection, stream_id::UInt32)
-    @lock conn.streams_lock begin
-        delete!(conn.streams, stream_id)
-    end
-end
-
-
-
-function create_client_stream!(conn::HTTP2Connection)
-    @lock conn.streams_lock begin
-        # Έλεγχος αν μπορούμε να δημιουργήσουμε νέο stream
-        if length(conn.streams) >= conn.remote_settings.max_concurrent_streams
-            throw(StreamLimitError("Cannot create new stream, remote limit reached"))
-        end
-
-        new_id = conn.last_stream_id
-        conn.last_stream_id += 2
-
-        stream = HTTP2Stream(new_id, conn)
-        add_stream(conn, stream)
-
-        return stream
-    end
-end
-
-"""
-    start_connection_loops!(conn::HTTP2Connection)
-
-Starts the asynchronous I/O and processing loops for the connection.
-This is the main entry point for running the connection.
-"""
-function start_connection_loops!(conn::HTTP2Connection)
-    conn_id = conn.id   
-    
-    @async io_loop_with_client_info(conn, conn_id)
-    @async processing_loop_with_client_info(conn, conn_id)
-
-    @async send_loop(conn.multiplexer)
-end
-
-function io_loop_with_client_info(conn::HTTP2Connection, conn_id::String)
-    role = conn.role
-    @debug "IO Loop: Starting for Role: $role, ID: $conn_id"
-
-    try
-        while isopen(conn.socket) && !eof(conn.socket)
-            header_bytes = read(conn.socket, 9)
-            if length(header_bytes) < 9; break; end
-            
-            header = H2Frames.deserialize_frame_header(header_bytes)
-            @debug "IO Loop ($role): Received frame header - Type: $(header.frame_type)), Stream: $(header.stream_id), Length: $(header.length)"
-            
-            payload_bytes = read(conn.socket, header.length)
-            if length(payload_bytes) < header.length; break; end
-            
-            frame = H2Frames.create_frame(header, payload_bytes)
-            
-            @debug "IO Loop ($role): Received full frame, queueing for processing -> Type: $(frame))"
-            put!(conn.frame_channel, frame)
-            
-            yield()
-        end
-    catch e
-        if !(e isa EOFError || (e isa Base.IOError && e.code in (-54, -32))) # -54: ECONNRESET, -32: EPIPE
-            @error "IO Loop Exception ($role, ID: $conn_id)" exception=(e, catch_backtrace())
-        else
-            @debug "IO Loop ($role, ID: $conn_id): Connection closed by peer."
-        end
-    finally
-        @debug "IO Loop ($role, ID: $conn_id): Shutting down."
-        close(conn.frame_channel)
-    end
-end
-
-function processing_loop_with_client_info(conn::HTTP2Connection, conn_id::String)
-    role = conn.role
-    @debug "Processing Loop: Starting for Role: $role, ID: $conn_id"
-    
-    try
-        for frame in conn.frame_channel
-            @debug "Processing Loop ($role): Dequeued frame -> Type: $(frame))"
-            process_received_frame(conn, frame)
-            @debug "Processing Loop ($role): Finished processing frame."
-            yield()
-        end
-    catch e
-        @error "Processing Loop Exception ($role, ID: $conn_id)" exception=(e, catch_backtrace())
-        if e isa HTTP2Exception
-            close_connection!(conn, exception_to_error_code(e), "Frame processing failed")
-        else
-            close_connection!(conn, :INTERNAL_ERROR, "Frame processing failed")
-        end
+function initiate_connection!(conn::H2Connection)
+    if conn.config.client_side
+        write(conn.outbound_buffer, CONNECTION_PREFACE)
     end
     
-    @debug "Processing Loop ($role, ID: $conn_id): Shutting down."
-end
-
-function process_received_frame_with_client_info(conn::HTTP2Connection, frame::HTTP2Frame, conn_id::String, client_desc::String)
+    settings_dict = Dict{UInt16, UInt32}((UInt16(k) => v for (k, v) in conn.local_settings))
+    settings_frame = H2Frames.SettingsFrame(settings_dict)
+    serialized_bytes = H2Frames.serialize_frame(settings_frame)
+    write(conn.outbound_buffer, serialized_bytes)
     
-    println("[FrameProcessor] Processing $(typeof(frame)) from client $client_desc (ID: $conn_id)")
-    
-    try
-        process_received_frame(conn, frame)
-    catch e
-        println("[FrameProcessor] Error processing frame from client $client_desc: $e")
-        rethrow()
-    end
+    @debug "Connection initiated. Preface and/or SETTINGS queued."
 end
 
+function receive_data!(conn::H2Connection, data::Vector{UInt8})::Vector{Events.Event}
+    seekend(conn.inbound_buffer)
+    write(conn.inbound_buffer, data)
+    seekstart(conn.inbound_buffer)
 
-
-
-
-"""
-    process_received_frame(conn::HTTP2Connection, frame::HTTP2Frame)
-
-Process a received frame, dispatching to connection-level or stream-level handlers.
-This is the main entry point for processing all incoming frames from the I/O loop.
-"""
-function process_received_frame(conn::HTTP2Connection, frame::HTTP2Frame)
-    sid = stream_id(frame)
-    role = is_client(conn) ? "CLIENT" : "SERVER"
-    @debug "[$role][T$(Threads.threadid())] Frame Processing: Starting for frame $(H2Frames.frame_summary(frame))" 
-
-    # 1. Apply Rate Limiting
-    if !consume_token!(conn.rate_limiter)
-        @warn "[Conn] Rate limit exceeded for connection $(conn.id). Sending ENHANCE_YOUR_CALM." 
-        last_stream = get_highest_stream_id(conn)
-        @lock conn.state_lock begin
-            send_goaway!(conn, last_stream, :ENHANCE_YOUR_CALM, "Rate limit exceeded")
-        end
-        close_connection!(conn, :ENHANCE_YOUR_CALM, "Rate limit exceeded") 
-        return
-    end
-
-    # 2. Dispatch Connection-Level Frames (Stream ID 0)
-    if sid == 0
-        process_connection_frame(conn, frame) # This function should also be refactored (see step 3)
-        @debug "[$role][T$(Threads.threadid())] Frame Processing: Finished connection-level frame." 
-        return
-    end
-
-    # 3. Handle Stream-Level Frames
-    if conn.continuation_stream_id != 0 && !(frame isa ContinuationFrame)
-        @error "[$role][T$(Threads.threadid())] Protocol Error: Expected CONTINUATION frame, got $(typeof(frame))." 
-        throw(ProtocolError("Invalid frame during continuation")) 
-    end
-
-    stream = get_stream(conn, sid)
-    is_new_stream = (stream === nothing)
-
-    # 4. Get or Create Stream
-    if is_new_stream
-        if !(frame isa HeadersFrame || frame isa PriorityFrame)
-            @error "[$role][T$(Threads.threadid())] Protocol Error: Received invalid frame for new stream $sid. Expected HEADERS or PRIORITY." 
-            throw(ProtocolError("Invalid frame type for new stream")) 
-        end
-        @debug "[$role][T$(Threads.threadid())] Frame Processing: Creating new stream $sid." 
-        stream = HTTP2Stream(sid, conn) 
-        add_stream(conn, stream) 
-        Streams.register_stream!(conn.multiplexer, stream) 
-    elseif !is_active(stream) && !(frame isa PriorityFrame)
-        # Per RFC 7540, ignore frames for closed streams, except PRIORITY.
-        @warn "Received frame for a closed stream. Ignoring." stream_id=sid frame_type=typeof(frame) 
-        return
-    end
-
-    # 5. Lock and Dispatch to the appropriate stream_frame handler
-    @lock conn.streams_lock begin
-        try
-            # The magic of multiple dispatch happens here!
-            process_stream_frame(conn, stream, frame)
-
-            # Spawn request handler if a new stream was just opened by receiving a complete HEADERS frame.
-            if is_new_stream && is_server(conn) && conn.request_handler !== nothing && frame isa HeadersFrame && frame.end_headers
-                @debug "[$role][T$(Threads.threadid())] ┗━ Spawning request handler for new stream $sid." 
-                errormonitor(@async conn.request_handler(conn, stream)) 
-            end
-        catch e
-            @error "[$role][T$(Threads.threadid())] Frame Processing -> ERROR during dispatch on stream $sid" exception=(e, catch_backtrace()) 
-            if stream !== nothing && is_active(stream)
-                # If something goes wrong, reset the specific stream.
-                Streams.mux_close_stream!(conn.multiplexer, sid, :INTERNAL_ERROR)
-            end
-        end
-    end
-    @debug "[$role][T$(Threads.threadid())] Frame Processing: <<<< FINISHED >>>> for frame on stream $sid."
-end
-
-function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame::HTTP2Frame)
-    role = is_client(conn) ? "CLIENT" : "SERVER"
-   @warn "[$role][T$(Threads.threadid())] Frame Processing: Unhandled or invalid frame type $(typeof(frame)) on stream $(stream.id). Ignoring."
-end
-
-"""
-Processes a HEADERS frame.
-"""
-function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame::HeadersFrame)
-    role = is_client(conn) ? "CLIENT" : "SERVER"
-    if !frame.end_headers
-        @debug "[$role][T$(Threads.threadid())] ┣━ Buffering HEADERS fragment for stream $(stream.id)..."
-        truncate(conn.header_buffer, 0)
-        write(conn.header_buffer, frame.header_block_fragment)
-        conn.continuation_stream_id = stream.id
-        conn.continuation_end_stream = frame.end_stream 
-    else
-        @debug "[$role][T$(Threads.threadid())] ┣━ DECODING headers for stream $(stream.id)..."
-        header_block = frame.header_block_fragment
-        
-        # Enforce MAX_HEADER_LIST_SIZE
-        if length(header_block) > conn.remote_settings.max_header_list_size
-            throw(ProtocolError("Header block size exceeds peer's MAX_HEADER_LIST_SIZE"))
-        end
-        local decoded_headers
-        decoded_headers = HPACK.decode_headers(conn.hpack_decoder, frame.header_block_fragment)
-        @debug "[$role][T$(Threads.threadid())] ┣━ CALLING receive_headers! for stream $(stream.id)..."
-        receive_headers!(stream, decoded_headers; end_stream=frame.end_stream)
-        @debug "[$role][T$(Threads.threadid())] ┣━ RETURNED from receive_headers! for stream $(stream.id)."
-    end
-end
-
-"""
-Processes a DATA frame.
-"""
-function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame::DataFrame)
-    role = is_client(conn) ? "CLIENT" : "SERVER"
-    @debug "[$role][T$(Threads.threadid())] ┣━ CALLING receive_data! for stream $(stream.id)..."
-    receive_data!(stream, frame.data; end_stream=frame.end_stream)
-    @debug "[$role][T$(Threads.threadid())] ┗━ RETURNED from receive_data! for stream $(stream.id)."
-end
-
-"""
-Processes a CONTINUATION frame.
-"""
-function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame::ContinuationFrame)
-    role = is_client(conn) ? "CLIENT" : "SERVER"
-    if frame.stream_id != conn.continuation_stream_id
-        throw(ProtocolError("CONTINUATION frame on wrong stream"))
-    end
-    @debug "[$role][T$(Threads.threadid())] ┣━ Buffering CONTINUATION fragment for stream $(stream.id)..."
-    write(conn.header_buffer, frame.header_block_fragment)
-   if frame.end_headers
-        full_header_block = take!(conn.header_buffer)
-        promised_id = conn.pending_push_promise_id
-        continuation_end_stream_flag = conn.continuation_end_stream
-        conn.continuation_stream_id = 0
-        conn.pending_push_promise_id = 0
-
-        decoded_headers = HPACK.decode_headers(conn.hpack_decoder, full_header_block)
-
-        if promised_id != 0
-            promised_stream = get_stream(conn, promised_id)
-            if promised_stream !== nothing
-                receive_headers!(promised_stream, decoded_headers; end_stream=false)
-                @debug "[CLIENT] Finished PUSH_PROMISE continuation for stream $(promised_id)."
-            end
-        else
-            # No, it was a regular HEADERS continuation.
-            # 'stream' is the correct target for the response headers.
-            receive_headers!(stream, decoded_headers; end_stream=continuation_end_stream_flag)
-        end
-    end
-end
-
-"""
-Processes a WINDOW_UPDATE frame.
-"""
-function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame::WindowUpdateFrame)
-    role = is_client(conn) ? "CLIENT" : "SERVER"
-    @debug "[$role][T$(Threads.threadid())] ┣━ Applying WINDOW_UPDATE for stream $(stream.id)..."
-    apply_flow_control_update(frame, conn) 
-    @debug "[$role][T$(Threads.threadid())] ┗━ Send window for stream $(stream.id) updated." 
-end
-
-"""
-Processes an RST_STREAM frame.
-"""
-function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame::RstStreamFrame)
-    role = is_client(conn) ? "CLIENT" : "SERVER"
-    @debug "[$role][T$(Threads.threadid())] ┣━ Processing RST_STREAM for stream $(stream.id)..." 
-    Streams.apply_rst_stream_frame!(conn, frame)
-    @debug "[$role][T$(Threads.threadid())] ┗━ Stream $(stream.id) has been reset." 
-end
-
-"""
-Processes a PRIORITY frame.
-"""
-function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame::PriorityFrame)
-    role = is_client(conn) ? "CLIENT" : "SERVER"
-    @debug "[$role][T$(Threads.threadid())] ┣━ Applying PRIORITY update for stream $(stream.id)..." 
-    Streams.apply_priority_frame!(conn, frame)
-    @debug "[$role][T$(Threads.threadid())] ┗━ Stream $(stream.id) priority updated." 
-end
-
-"""
-Processes a PUSH_PROMISE frame.
-"""
-function process_stream_frame(conn::HTTP2Connection, stream::HTTP2Stream, frame::PushPromiseFrame)
-    if is_client(conn)
-        role = "CLIENT"
-        @debug "[$role][T$(Threads.threadid())] ┣━ Processing PUSH_PROMISE for associated stream $(stream.id)..." 
-        process_push_promise(conn, frame)
-        @debug "[$role][T$(Threads.threadid())] ┗━ PUSH_PROMISE for stream $(frame.promised_stream_id) processed." 
-    else
-        throw(ProtocolError("Server received a PUSH_PROMISE frame on stream $(stream.id)"))
-    end
-    @debug "[$role][T$(Threads.threadid())] Frame Processing: <<<< FINISHED >>>> for frame on stream $sid."
-end
-
-"""
-    send_preface!(conn::HTTP2Connection)
-
-Send the HTTP/2 connection preface.
-For clients, this is the magic string followed by a SETTINGS frame.
-For servers, this is just a SETTINGS frame.
-"""
-
-function send_preface!(conn::HTTP2Connection)
-    @lock conn.state_lock begin
-        if conn.preface_sent || conn.state != CONNECTION_IDLE
-            return
-        end
-
-        try
-            if is_client(conn)
-                println("[Conn] Client: Sending raw preface string.")
-                write(conn.socket, CONNECTION_PREFACE)
-            end
-            println("[Conn] $(conn.role): Sending initial SETTINGS frame.")
-            settings_frame = H2Settings.create_settings_frame(conn.settings)
-            
-            send_frame(conn, serialize_frame(settings_frame))
-            
-            flush(conn.socket)
-
-            conn.preface_sent = true
-            
-            transition_state!(conn, CONNECTION_OPEN)
-            println("[Conn] Preface sent successfully, state transitioned to OPEN.")
-
-        catch e
-            @error "Failed to send preface: $e"
-            handle_connection_error!(conn, :INTERNAL_ERROR, "Failed to send preface")
-        end
-    end
-end
-
-"""
-    receive_preface!(conn::HTTP2Connection)
-
-Blocks to read and validate the client's connection preface. This is a critical
-step for the server to synchronize with the client before frame processing begins.
-"""
-
-
-function receive_preface!(conn::HTTP2Connection)
-    try
-        if is_server(conn)
-            preface_bytes = read(conn.socket, length(CONNECTION_PREFACE))
-            if preface_bytes != CONNECTION_PREFACE
-                throw(ProtocolError("Invalid connection preface"))
+    if !conn.config.client_side && !conn.preface_received
+        if _is_http11_upgrade_request(conn.inbound_buffer)
+            events = _handle_h2c_upgrade(conn)
+            if !isempty(events)
+                return events
             end
         end
         
-        header_bytes = read(conn.socket, FRAME_HEADER_SIZE)
+        preface_len = length(CONNECTION_PREFACE)
+        if bytesavailable(conn.inbound_buffer) >= preface_len
+            received_preface = read(conn.inbound_buffer, preface_len)
+            if received_preface != Vector{UInt8}(CONNECTION_PREFACE)
+                throw(H2Exceptions.ProtocolError("Invalid connection preface"))
+            end
+            conn.preface_received = true
+        else
+            return Events.Event[]
+        end
+    end
+
+    events = Events.Event[]
+    last_successful_position = position(conn.inbound_buffer)
+
+    while bytesavailable(conn.inbound_buffer) >= H2Frames.FRAME_HEADER_SIZE
+        mark(conn.inbound_buffer)
+        header_bytes = read(conn.inbound_buffer, H2Frames.FRAME_HEADER_SIZE)
         header = H2Frames.deserialize_frame_header(header_bytes)
+        frame_length = H2Frames.FRAME_HEADER_SIZE + header.length
+        reset(conn.inbound_buffer)
 
-        if header.frame_type != SETTINGS_FRAME || (header.flags & SETTINGS_ACK) != 0
-            throw(ProtocolError("Expected first frame to be a non-ACK SETTINGS frame."))
+        max_size = get(conn.local_settings, SETTINGS_MAX_FRAME_SIZE, 16384)
+        if header.length > max_size
+            throw(FrameTooLargeError("Received frame of size $(header.length) exceeds max frame size $max_size"))
         end
-        
-        payload = read(conn.socket, header.length)
-        settings_frame = create_frame(header, payload)
-        
-        process_settings_frame(conn, settings_frame)
-        
-        conn.preface_received = true
-        @debug  "[Conn] Peer preface received and processed successfully."
-        return
 
-    catch e
-        if e isa HTTP2Exception
-            close_connection!(conn, exception_to_error_code(e), "Failed to receive preface: $e")
-        else
-            close_connection!(conn, :INTERNAL_ERROR, "Failed to receive preface: $e")
+        if bytesavailable(conn.inbound_buffer) < frame_length
+            break
         end
-        rethrow(e)
-    end
-end
 
-
-
-# src/Connection.jl
-
-"""
-Fallback for invalid frame types on the connection stream (ID 0).
-"""
-function process_connection_frame(conn::HTTP2Connection, frame::HTTP2Frame)
-    throw(ProtocolError("Invalid frame type $(typeof(frame)) for stream 0"))
-end
-
-"""
-Processes a connection-level SETTINGS frame.
-"""
-function process_connection_frame(conn::HTTP2Connection, frame::SettingsFrame)
-    if is_ack(frame)
-        @debug  "[Conn] Received SETTINGS ACK from peer."
-    else
-        process_settings_frame(conn, frame)
-            
-        if is_client(conn)
-            # Atomically check and set the preface flag under the state_lock
-            @lock conn.state_lock begin
-                if !conn.preface_received
-                    conn.preface_received = true
-                    # The notify is for more advanced waiting patterns,
-                    # but it's good to keep it here under the correct lock.
-                    notify(conn.preface_handshake_done)
-                end
+        unmark(conn.inbound_buffer)
+        read(conn.inbound_buffer, H2Frames.FRAME_HEADER_SIZE)
+        payload_bytes = read(conn.inbound_buffer, header.length)
+        
+        try
+            frame_obj = H2Frames.create_frame(header, payload_bytes)
+            new_events = process_frame(conn, frame_obj)
+            if !isnothing(new_events) && !isempty(new_events)
+                append!(events, new_events)
             end
-            @debug "[Client] Handshake complete: Received server SETTINGS."
-        end
-    end
-end
-
-"""
-Processes a connection-level PING frame.
-"""
-function process_connection_frame(conn::HTTP2Connection, frame::PingFrame)
-    process_ping_frame(conn, frame) 
-end
-
-"""
-Processes a GOAWAY frame.
-"""
-function process_connection_frame(conn::HTTP2Connection, frame::GoAwayFrame)
-    process_goaway_frame(conn, frame)
-end
-
-"""
-Processes a connection-level WINDOW_UPDATE frame.
-"""
-function process_connection_frame(conn::HTTP2Connection, frame::WindowUpdateFrame)
-    apply_flow_control_update(frame, conn)
-end
-
-"""
-A PUSH_PROMISE frame MUST be associated with an existing, open stream.
-Receiving one on stream 0 is a connection error.
-"""
-function process_connection_frame(conn::HTTP2Connection, frame::PushPromiseFrame)
-    throw(ProtocolError("Received PUSH_PROMISE frame on connection stream 0")) 
-end
-
-"""
-    process_goaway_frame(connection::HTTP2Connection, frame::GoAwayFrame)
-
-Process a received GOAWAY frame on the given connection.
-
-This will:
-1. Mark the connection as closing/closed
-2. Cancel streams higher than last_stream_id
-3. Prevent new streams from being created
-4. Call user callbacks if registered
-"""
-
-function process_goaway_frame(conn::HTTP2Connection, frame::GoAwayFrame)
-    @debug "[Conn] Received GOAWAY" last_stream_id=frame.last_stream_id error_code=Exc.error_code_name(frame.error_code)
-    streams_to_cancel = HTTP2Stream[]
-
-    @lock conn.state_lock begin
-        if conn.goaway_received
-            return
-        end
-
-        conn.goaway_received = true
-        conn.last_peer_stream_id = frame.last_stream_id
-        transition_state!(conn, CONNECTION_GOAWAY_RECEIVED)
-
-        for (sid, stream) in conn.streams
-            if sid > frame.last_stream_id && is_client(conn) == isodd(sid)
-                push!(streams_to_cancel, stream)
+        catch e
+            if e isa H2Error
+                rethrow()
+            else
+                throw(H2Exceptions.ProtocolError("Failed to parse frame: $e"))
             end
         end
-    end 
 
-    for stream in streams_to_cancel
-        @debug "[Conn] Closing stream $(stream.id) due to GOAWAY"
-        mux_close_stream!(conn.multiplexer, stream.id, :REFUSED_STREAM)
+        last_successful_position = position(conn.inbound_buffer)
     end
-end
-
-"""
-    process_ping_frame(connection::HTTP2Connection, frame::PingFrame)
-
-Process a received PING frame on the given connection.
-
-If the frame is a PING request, automatically sends a PING ACK response.
-If the frame is a PING ACK, processes it as a response to an outstanding PING.
-"""
-
-
-function process_ping_frame(connection::HTTP2Connection, frame::PingFrame)
-    if !H2Frames.Ping.is_ping_ack(frame)
-        @debug "[Conn] Received PING request, queuing ACK."
-        
-        ack_frame = H2Frames.Ping.PingAckFrame(frame)
     
-        send_frame_on_stream(connection.multiplexer, UInt32(0), ack_frame)
-        
-    else
-        @debug "[Conn] Received PING ACK."
-        ping_id = get_ping_data_as_uint64(frame)
-        
-        entry = @lock connection.pings_lock begin
-            pop!(connection.pending_pings, ping_id, nothing)
-        end
+    seek(conn.inbound_buffer, last_successful_position)
+    remaining_bytes = readavailable(conn.inbound_buffer)
+    truncate(conn.inbound_buffer, 0)
+    write(conn.inbound_buffer, remaining_bytes)
 
-        if entry !== nothing
-            start_time, response_channel = entry
-            if isopen(response_channel)
-                rtt = time() - start_time
-                @debug "[Conn] PING RTT calculated: $rtt. Notifying waiting task."
-                put!(response_channel, rtt)
-            end
-        else
-            @warn "[Conn] Received PING ACK for unknown id: $ping_id (likely timed out)."
-        end
-    end
+    return events
 end
 
-
-"""
-    get_debug_message(frame::GoAwayFrame) -> String
-
-Get the debug data as a UTF-8 string from a GOAWAY frame.
-"""
-function get_debug_message(frame::GoAwayFrame)
+function _is_http11_upgrade_request(buffer::IOBuffer)::Bool
+    """Check if buffer starts with HTTP/1.1 request line"""
+    original_pos = position(buffer)
+    
     try
-        return String(frame.debug_data)
-    catch
-        return "0x" * bytes2hex(frame.debug_data)
-    end
-end
-
-"""
-Handles a received PUSH_PROMISE frame.
-"""
-function process_push_promise(conn::HTTP2Connection, frame::PushPromiseFrame)
-    original_stream = get_stream(conn, frame.stream_id)
-    if original_stream === nothing || !is_active(original_stream)
-        @warn "Received PUSH_PROMISE on a non-existent or inactive stream $(frame.stream_id). Ignoring."
-        return
-    end
-
-    # Step 1: ALWAYS create and register the promised stream locally first.
-    promised_stream = HTTP2Stream(frame.promised_stream_id, conn)
-    add_stream(conn, promised_stream)
-    Streams.register_stream!(conn.multiplexer, promised_stream)
-    transition_stream_state!(promised_stream, :recv_push_promise)
-
-    # Step 2: Decide whether to keep or reject the stream.
-    if !conn.settings.enable_push
-        @debug "[CLIENT] Push is disabled. Rejecting promised stream $(frame.promised_stream_id)."
-        error_val = Exc.error_code_value(REFUSED_STREAM)
-        rst = RstStreamFrame(frame.promised_stream_id, error_val)
-        send_frame_on_stream(conn.multiplexer, frame.promised_stream_id, rst)
-        return
-    end
-
-    # Step 3: Handle the header block, now with CONTINUATION support.
-    if !frame.end_headers
-        # The header block is fragmented. Start the continuation sequence.
-        @debug "[CLIENT] Buffering PUSH_PROMISE fragment for promised stream $(frame.promised_stream_id)..."
-        truncate(conn.header_buffer, 0)
-        write(conn.header_buffer, frame.header_block_fragment)
+        seekstart(buffer)
+        if bytesavailable(buffer) < 14  # Minimum for "GET / HTTP/1.1"
+            return false
+        end
         
-        # Track the stream whose headers are being continued (the original stream)
-        conn.continuation_stream_id = frame.stream_id 
-        # Track the target stream for these headers (the new pushed stream)
-        conn.pending_push_promise_id = frame.promised_stream_id
-    else
-        # The header block is complete. Decode and assign.
-        decoded_headers = HPACK.decode_headers(conn.hpack_decoder, frame.header_block_fragment)
-        promised_stream.headers = decoded_headers
-        @debug "[CLIENT] Processed complete PUSH_PROMISE for stream $(promised_stream.id)."
+        first_bytes = read(buffer, min(100, bytesavailable(buffer)))
+        first_line = String(first_bytes)
+        
+        return occursin(r"^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+.+\s+HTTP/1\.1\r?\n", first_line)
+    finally
+        seek(buffer, original_pos)
     end
 end
 
-"""
-    process_initial_push_promise(conn::HTTP2Connection, frame::PushPromiseFrame)
-
-Handles the initial receipt of a PUSH_PROMISE frame. This function is responsible
-for validating the push and creating the new stream in a 'reserved (remote)' state.
-The header block itself will be processed once the full sequence is received.
-"""
-function process_initial_push_promise(conn::HTTP2Connection, frame::PushPromiseFrame)
-    if is_server(conn) || iseven(frame.stream_id)
-        throw(ProtocolError("Server cannot receive PUSH_PROMISE H2Frames."))
-    end
-
-    if !conn.settings.enable_push
-        rst_frame = create_rst_stream_response(frame.promised_stream_id, REFUSED_STREAM)
-        send_frame_on_stream(conn.multiplexer, frame.promised_stream_id, rst_frame)
-        return
-    end
-
-    if isodd(frame.promised_stream_id) || has_stream(conn, frame.promised_stream_id)
-        throw(ProtocolError("PUSH_PROMISE received with invalid or duplicate promised stream ID.", frame.stream_id))
-    end
-
-    promised_stream = HTTP2Stream(frame.promised_stream_id, conn)
-    add_stream(conn, promised_stream)
-    Streams.register_stream!(conn.multiplexer, promised_stream)
-
-    transition_stream_state!(promised_stream, :recv_push_promise)
-
-end
-
-"""
-    process_settings_frame(frame::SettingsFrame, connection) -> Nothing
-
-Process a received SETTINGS frame and update connection state.
-"""
-
-
-function process_settings_frame(conn::HTTP2Connection, frame::SettingsFrame)
-    if is_ack(frame)
-        @debug  "[Conn] Received SETTINGS ACK."
-        return
-    end
-
-    H2Settings.apply_settings!(conn.remote_settings, frame)
-    @debug  "[Conn] Applied peer settings: $(settings_to_string(frame.parameters))"
-    ack_frame = create_settings_ack()
-    send_frame(conn, serialize_payload(ack_frame))
-    @debug  "[Conn] Sent SETTINGS ACK."
-end
-
-"""
-    apply_flow_control_update(frame::WindowUpdateFrame, connection_state) -> Nothing
-
-Applies the flow control window update to the appropriate window.
-
-This function should be called when processing received WINDOW_UPDATE H2Frames
-to update the local flow control windows.
-"""
-# Connection Logic
-function apply_flow_control_update(frame::WindowUpdateFrame, conn::HTTP2Connection)
-    if frame.stream_id == 0
-        update_send_window!(conn, frame.window_size_increment)
-    else
-        stream = get_stream(conn, frame.stream_id)
-        if stream !== nothing
-            update_send_window!(stream, frame.window_size_increment)
-        else
-           # Per RFC 7540, 6.9: A receiver MUST treat the receipt of a
-           # WINDOW_UPDATE frame on a closed stream as a connection error.
-           throw(ProtocolError("Received WINDOW_UPDATE for closed or non-existent stream $(frame.stream_id)"))
-        end
-    end
-end
-
-
-"""
-    apply_settings(conn::HTTP2Connection, settings::Dict{UInt16, UInt32})
-
-Apply settings received from the remote peer.
-"""
-function apply_settings(conn::HTTP2Connection, settings::Dict{UInt16, UInt32})
-    for (setting_id, value) in settings
-        if setting_id == SETTINGS_HEADER_TABLE_SIZE
-            resize_hpack_table(conn.hpack_encoder, value)
-        elseif setting_id == SETTINGS_ENABLE_PUSH
-            conn.remote_settings.enable_push = value != 0
-        elseif setting_id == SETTINGS_MAX_CONCURRENT_STREAMS
-            conn.remote_settings.max_concurrent_streams = value
-        elseif setting_id == SETTINGS_INITIAL_WINDOW_SIZE
-            old_window_size = conn.remote_settings.initial_window_size
-            conn.remote_settings.initial_window_size = value
-            
-            window_diff = Int32(value - old_window_size)
-            for stream in values(conn.streams)
-                stream.remote_window_size += window_diff
-            end
-        elseif setting_id == SETTINGS_MAX_FRAME_SIZE
-            conn.remote_settings.max_frame_size = value
-        elseif setting_id == SETTINGS_MAX_HEADER_LIST_SIZE
-            conn.remote_settings.max_header_list_size = value
-        end
-    end
-end
-
-
-"""
-    close_connection!(conn::HTTP2Connection, error_code::Symbol = :NO_ERROR, 
-debug_message::String = ""; grace_period::Float64 = 5.0)
-
-Shuts down the connection. Sends a GOAWAY frame with an optional debug message
-if the connection is currently open, and then closes all streams and the underlying socket.
-This function is thread-safe.
-
-Arguments:
-- `conn::HTTP2Connection`: The connection to close.
-- `error_code::Symbol`: The error code for the GOAWAY frame.
-- `debug_message::String`: An optional debug message.
-- `grace_period::Float64`: Time in seconds to wait for active streams to complete before force-closing.
-"""
-function close_connection!(conn::HTTP2Connection, error_code::Symbol = :NO_ERROR, debug_message::String = ""; grace_period::Float64 = 5.0)
-    # Acquire locks in a consistent order to prevent deadlock.
-    @lock conn.state_lock begin
-        if conn.state == CONNECTION_CLOSED
-            return
-        end
-
-        local streams_to_watch::Vector{HTTP2Stream}
-
-        @lock conn.streams_lock begin
-            # Identify streams that should be allowed to finish.
-            streams_to_watch = [s for s in values(conn.streams) if is_active(s)]
-
-            if isopen(conn.socket)
+function _handle_h2c_upgrade(conn::H2Connection)::Vector{Events.Event}
+    seekstart(conn.inbound_buffer)
+    request_data = readavailable(conn.inbound_buffer)
+    request_str = String(request_data)
     
-            last_stream_id = get_highest_stream_id(conn) |> UInt32
-                send_goaway!(conn, last_stream_id, error_code, debug_message)
-            end
-        end # Release streams_lock
-
-        # Graceful wait period (occurs outside the streams_lock)
-        if !isempty(streams_to_watch) && grace_period > 0
-            @info "[Conn] Graceful shutdown initiated. Waiting up to $(grace_period)s for $(length(streams_to_watch)) active streams."
-            start_time = time()
-            while (time() - start_time) < grace_period
-                # Remove streams that have closed.
-                filter!(is_active, streams_to_watch)
-                if isempty(streams_to_watch)
-                    @info "[Conn] All active streams closed gracefully."
-                    break
-                end
-                sleep(0.1) # Check every 100ms
-            end
-
-            if !isempty(streams_to_watch)
-                @warn "[Conn] Grace period ended. $(length(streams_to_watch)) streams still active. Force-closing."
-            end
-        end
-        
-        # Final cleanup (re-acquire streams_lock)
-        @lock conn.streams_lock begin
-            for stream in values(conn.streams)
-        
-        Streams.mux_close_stream!(conn.multiplexer, stream.id, error_code)
-            end
-
-            empty!(conn.streams)
-
-            try
-                if isopen(conn.socket)
-                    close(conn.socket)
-                end
-            catch
-                # Ignore errors on close
-      
-      end
-            
-    transition_state!(conn, CONNECTION_CLOSED)
-        end # Release streams_lock
-    end # Release state_lock
-end
-
-"""
-    is_graceful_shutdown(frame::GoAwayFrame) -> Bool
-
-Check if this GOAWAY frame indicates a graceful shutdown (NO_ERROR).
-"""
-is_graceful_shutdown(frame::GoAwayFrame) = frame.error_code == UInt32(NO_ERROR)
-
-"""
-    is_error_shutdown(frame::GoAwayFrame) -> Bool
-
-Check if this GOAWAY frame indicates an error condition.
-"""
-is_error_shutdown(frame::GoAwayFrame) = frame.error_code != UInt32(NO_ERROR)
-
-"""
-    send_goaway!(conn::HTTP2Connection, last_stream_id::UInt32, error_code::Symbol=:NO_ERROR, debug_message::String="")
-
-Queues a GOAWAY frame for sending via the multiplexer and transitions the connection state.
-This is the single, correct way to send a GOAWAY frame.
-"""
-function send_goaway!(conn::HTTP2Connection, last_stream_id::UInt32, error_code::Symbol=:NO_ERROR, debug_message::String="")
-    @lock conn.state_lock begin
-        if conn.goaway_sent
-            return
-        end
-        
-        @debug "Queueing GOAWAY frame" last_stream_id=last_stream_id error_code=error_code debug_message=debug_message
-        
-        frame = GoAwayFrame(last_stream_id, Exc.error_code_value(error_code), Vector{UInt8}(debug_message))
-        
-        send_frame_on_stream(conn.multiplexer, 0, frame)
-        
-        conn.goaway_sent = true
-        transition_state!(conn, CONNECTION_GOAWAY_SENT)
+    if !occursin(r"Upgrade:\s*h2c", request_str) || !occursin(r"Connection:.*Upgrade", request_str)
+        truncate(conn.inbound_buffer, 0)
+        write(conn.inbound_buffer, request_data)
+        return Events.Event[]
     end
-end
-
-"""
-    get_highest_stream_id(connection::HTTP2Connection) -> UInt32
-
-Get the highest stream ID that has been processed on this connection.
-"""
-function get_highest_stream_id(connection::HTTP2Connection)
-    @lock connection.streams_lock begin # <-- Ensure this uses "connection"
-        if !isempty(connection.streams)
-            return maximum(keys(connection.streams))
-        else
-            return 0
-        end
-    end
-end
-
-
-"""
-    update_window(conn::HTTP2Connection, increment::UInt32)
-
-Send a connection-level WINDOW_UPDATE frame.
-"""
-function update_window(conn::HTTP2Connection, increment::UInt32)
-    if increment == 0
-        throw(ProtocolError("WINDOW_UPDATE increment cannot be zero"))
-    end
-    window_update = WindowUpdateFrame(0, increment)
-    send_frame(conn, window_update)
-    conn.window_size += Int32(increment)
-end
-
-
-"""
-    update_send_window!(conn::HTTP2Connection, increment::UInt32)
-
-Increases the connection-level send window. Called on receipt of a WINDOW_UPDATE.
-"""
-function update_send_window!(conn::HTTP2Connection, increment::UInt32)
-    @lock conn.flow_control_lock begin
-        new_window = Int64(conn.send_window) + Int64(increment)
-        if new_window > MAX_WINDOW_SIZE
-            throw(FlowControlError("Connection send window overflow", 0))
-        end
-        conn.send_window = Int32(new_window)
-    end
-end
-
-"""
-    update_send_window!(stream::HTTP2Stream, increment::UInt32)
-
-Increases the stream-level send window. Called on receipt of a WINDOW_UPDATE.
-"""
-function update_send_window!(stream::HTTP2Stream, increment::UInt32)
-    new_window = Int64(stream.send_window) + Int64(increment)
-    if new_window > MAX_WINDOW_SIZE
-        throw(FlowControlError("Stream send window overflow", stream.id))
-    end
-    stream.send_window = Int32(new_window)
-end
-
-"""
-    consume_receive_window!(stream::HTTP2Stream, amount::Int)
-
-Consumes bytes from the receive windows. Called on receipt of a DATA frame.
-"""
-function consume_receive_window!(stream::HTTP2Stream, amount::Int)
-    conn = stream.connection
-    if amount > stream.receive_window || amount > conn.receive_window
-        throw(FlowControlError("Received more data than the advertised window size", stream.id))
-    end
-    stream.receive_window -= amount
-    @lock conn.flow_control_lock begin
-        conn.receive_window -= amount
-    end
-end
-
-
-"""
-    reset_connection_window!(conn::HTTP2Connection)
-
-Reset the connection-level window to the initial value.
-"""
-function reset_connection_window!(conn::HTTP2Connection)
-    conn.receive_window = Int32(conn.settings.initial_window_size)
-    conn.send_window = Int32(conn.settings.initial_window_size)
-end
-
-"""
-    reset_stream_window!(conn::HTTP2Connection, stream_id::UInt32)
-
-Reset a stream's window to the initial value.
-"""
-function reset_stream_window!(stream::HTTP2Stream)
-    stream.receive_window = Int32(stream.connection.settings.initial_window_size)
-    stream.send_window = Int32(stream.connection.settings.initial_window_size)
-end
-
-"""
-    update_all_stream_send_windows!(conn::HTTP2Connection, difference::Int64)
-
-Applies a change to the initial window size to all active streams.
-This is called when SETTINGS_INITIAL_WINDOW_SIZE is changed by the remote peer,
-adjusting each stream's `send_window`. Throws a FlowControlError on overflow.
-"""
-function _update_all_stream_send_windows_unsafe!(conn::HTTP2Connection, difference::Int64)
-    println("[FlowControl] Updating all stream send windows by: $difference (unsafe version)")
-    @lock conn.flow_control_lock begin
-    for stream in values(conn.streams)
-            new_window = Int64(stream.send_window) + difference
-            
-            if new_window > MAX_WINDOW_SIZE
-                throw(FlowControlError("Stream send window overflow due to SETTINGS update", stream.id))
-            end
-            
-            stream.send_window = Int32(new_window)
-            println("[FlowControl] Updated stream $(stream.id) send window to: $(stream.send_window)")
-        end
-    end
-    println("[FlowControl] All stream send windows updated successfully")
-end
-
-function update_all_stream_send_windows!(conn::HTTP2Connection, difference::Int64)
-    @lock conn.streams_lock begin
-        _update_all_stream_send_windows_unsafe!(conn, difference)
-    end
-end
-
-"""
-    apply_settings_dict!(settings::HTTP2Settings, dict::Dict{UInt16, UInt32})
-
-Apply settings from a dictionary (typically from a received SETTINGS frame).
-Validates each setting before applying.
-"""
-function apply_settings_dict!(conn::HTTP2Connection, dict::Dict{UInt16, UInt32})
-    settings = conn.remote_settings
-    for (setting_id, value) in dict
-        apply_setting!(conn, setting_id, value)
-    end
-    validate_settings(settings)
-end
-
-"""
-    update_initial_window_size!(conn::HTTP2Connection, old_size::UInt32, new_size::UInt32)
-
-Update the initial window size setting and adjust all existing streams' flow control windows.
-This is called when SETTINGS_INITIAL_WINDOW_SIZE changes.
-"""
-function update_initial_window_size!(conn::HTTP2Connection, old_size::UInt32, new_size::UInt32)
-    window_diff = Int64(new_size) - Int64(old_size)
     
-    for stream in values(conn.streams)
-        new_window = Int64(stream.receive_window) + window_diff
-        
-        if new_window > MAX_WINDOW_SIZE
-            throw(HTTP2Error(UInt32(FLOW_CONTROL_ERROR), "Window size overflow for stream $(stream.id)"))
-        elseif new_window < -MAX_WINDOW_SIZE
-            throw(HTTP2Error(UInt32(FLOW_CONTROL_ERROR), "Window size underflow for stream $(stream.id)"))
+    http2_settings = Dict{UInt16, UInt32}()
+    settings_match = match(r"HTTP2-Settings:\s*([A-Za-z0-9+/=]+)", request_str)
+    if !isnothing(settings_match)
+        try
+            settings_b64 = settings_match.captures[1]
+            settings_bytes = Base64.base64decode(settings_b64)
+            if length(settings_bytes) >= H2Frames.FRAME_HEADER_SIZE + 6 
+                header_bytes = settings_bytes[1:H2Frames.FRAME_HEADER_SIZE]
+                header = H2Frames.deserialize_frame_header(header_bytes)
+                
+                if header.frame_type == H2Frames.SETTINGS_FRAME
+                    payload_bytes = settings_bytes[H2Frames.FRAME_HEADER_SIZE+1:end]
+                    settings_frame = H2Frames.deserialize_settings_frame(header, payload_bytes)
+                    
+                    for (key, value) in settings_frame.parameters
+                        try
+                            setting_param = H2Frames.SettingsParameter(key)
+                            conn.remote_settings[setting_param] = value
+                            http2_settings[key] = value
+                        catch e
+                            @debug "Unknown or invalid setting key: $key"
+                        end
+                    end
+                end
+            else
+                if length(settings_bytes) >= 6 
+                    i = 1
+                    while i + 5 <= length(settings_bytes)
+                        setting_id = (UInt16(settings_bytes[i]) << 8) | UInt16(settings_bytes[i+1])
+                        setting_value = (UInt32(settings_bytes[i+2]) << 24) | 
+                                       (UInt32(settings_bytes[i+3]) << 16) | 
+                                       (UInt32(settings_bytes[i+4]) << 8) | 
+                                       UInt32(settings_bytes[i+5])
+                        
+                        http2_settings[setting_id] = setting_value
+                        
+                        try
+                            setting_param = H2Frames.SettingsParameter(setting_id)
+                            conn.remote_settings[setting_param] = setting_value
+                        catch e
+                            @debug "Unknown or invalid setting key: $setting_id"
+                        end
+                        
+                        i += 6
+                    end
+                end
+            end
+        catch e
+            @debug "Failed to parse HTTP2-Settings header: $e"
         end
-        
-        stream.receive_window = Int32(new_window)
     end
+    
+    switching_response = join([
+        "HTTP/1.1 101 Switching Protocols",
+        "Connection: Upgrade", 
+        "Upgrade: h2c",
+        "", "" 
+    ], "\r\n")
+    
+    write(conn.outbound_buffer, switching_response)
+    truncate(conn.inbound_buffer, 0)
+    return [Events.H2CUpgradeReceived(http2_settings)]
 end
 
-"""
-    handle_connection_error!(conn::HTTP2Connection, error_code::ErrorCode, msg::AbstractString = "")
 
-Handle a connection-level error: send GOAWAY, close streams, and transition to CLOSED.
-"""
 
-function handle_connection_error!(conn::HTTP2Connection, error_code::Symbol, msg::AbstractString = "")
-    @lock conn.state_lock begin
-        if conn.state == CONNECTION_CLOSED 
-            return
-        end
-        @error "Connection Error" msg error_code
+function process_frame(conn::H2Connection, frame::H2Frames.HTTP2Frame)
+    sid = UInt32(H2Frames.stream_id(frame))
 
-        if conn.state == CONNECTION_IDLE
-            transition_state!(conn, CONNECTION_CLOSED)
+    if sid == 0
+        if frame isa H2Frames.FrameSettings.SettingsFrame
+            if H2Frames.is_ack(frame)
+                return Events.Event[]
+            end
+            changed_settings = Dict{Symbol, UInt32}()
+            for (key, value) in frame.parameters
+                param = H2Frames.setting_name(key)
+                const_key = getfield(H2Frames, param)
+                conn.remote_settings[const_key] = value
+                changed_settings[Symbol(param)] = value
+            end
+            events = Events.Event[]
+            push!(events, Events.SettingsChanged(changed_settings))
+            ack_frame = H2Frames.SettingsFrame(Dict{UInt16, UInt32}(); ack=true)
+            serialized_ack = H2Frames.serialize_frame(ack_frame)
+            write(conn.outbound_buffer, serialized_ack)
+            return events
+        elseif frame isa H2Frames.PingFrame
+            if H2Frames.is_ping_ack(frame)
+                return [Events.PingAck(Vector{UInt8}(frame.data))]
+            else
+                pong_frame = H2Frames.PingFrame(frame.data; ack=true)
+                write(conn.outbound_buffer, H2Frames.serialize_frame(pong_frame))
+                return [Events.PingReceived(Vector{UInt8}(frame.data))]
+            end
+
+        elseif frame isa H2Frames.GoAwayFrame
+            last_stream_id = UInt32(frame.last_stream_id)
+            error_code = UInt32(frame.error_code)
+            debug_data = Vector{UInt8}(frame.debug_data)
+            return [Events.ConnectionTerminated(last_stream_id, error_code, debug_data)]
+
+        elseif frame isa H2Frames.WindowUpdateFrame
+            increment = UInt32(frame.window_size_increment)
+            if increment == 0
+                throw(ProtocolError("WINDOW_UPDATE increment on connection cannot be zero"))
+            end
+            new_window = conn.send_window + increment 
+            if new_window > 2^31 - 1
+                throw(FlowControlError("Connection flow control window overflow"))
+            end
+            conn.send_window = new_window
+            return [Events.WindowUpdated(sid, increment)]
+            
         else
-            transition_state!(conn, CONNECTION_CLOSING)
+            throw(ProtocolError("Invalid frame type $(typeof(frame)) on stream 0"))
         end
+    end
+    if frame isa H2Frames.PriorityFrame
+        if frame.stream_dependency == sid
+            throw(ProtocolError("Stream $sid cannot depend on itself"))
+        end
+        stream = _get_or_create_stream(conn, sid) # Priority is allowed to create idle stream
+        priority = Events.Priority(UInt32(frame.stream_dependency), UInt8(frame.weight), frame.exclusive)
+        stream.priority = priority
+        return [Events.PriorityChanged(sid, priority)]
+    end
+
+
+    can_create_stream = frame isa H2Frames.Headers.HeadersFrame || frame isa H2Frames.PushPromiseFrame
+    stream = _get_stream(conn, sid, can_create=can_create_stream)
+
+    if isnothing(stream)
+        if !(frame isa H2Frames.WindowUpdateFrame || frame isa H2Frames.PriorityFrame || frame isa H2Frames.RstStreamFrame)
+            write(conn.outbound_buffer, H2Frames.serialize_frame(reset_frame))
+        end
+        return nothing
+    end
+
+        if frame isa H2Frames.RstStreamFrame
+        stream.state = :closed
+        return [Events.StreamReset(sid, UInt32(frame.error_code))]
+    end
+
+    if frame isa H2Frames.FrameData.DataFrame
+        data_len = UInt32(length(frame.data))
+        window_consumed!(stream.inbound_window_manager, data_len)
+        window_consumed!(conn.inbound_window_manager, data_len)
+
+        if stream.state != :open && stream.state != :half_closed_remote
+            throw(ProtocolError("Received DATA on stream $sid in state $(stream.state)"))
+        end
+
+        events = Events.Event[]
+        push!(events, Events.DataReceived(sid, frame.data, data_len, frame.end_stream))
+        if frame.end_stream
+            push!(events, Events.StreamEnded(sid))
+            stream.state = :half_closed_remote
+        end
+        return events
+
+    elseif frame isa H2Frames.Headers.HeadersFrame
+        stream.state = :open
+        events = Events.Event[]
+        headers = Vector{Pair{String, String}}()
+        try
+            headers = HPACK.decode_headers(conn.hpack_decoder, frame.header_block_fragment)
+        catch e
+            throw(ProtocolError("HPACK decoding failed: $e"))
+        end
+        _validate_received_headers(headers)
+        
+        method_idx = findfirst(h -> h.first == ":method", headers)
+        status_idx = findfirst(h -> h.first == ":status", headers)
+        
+        priority = nothing
+        if hasproperty(frame, :priority) && !isnothing(frame.priority)
+            if !(frame.priority isa Bool) && hasproperty(frame.priority, :stream_dependency)
+                priority = Events.Priority(UInt32(frame.priority.stream_dependency), UInt8(frame.priority.weight), frame.priority.exclusive)
+                stream.priority = priority
+            end
+        end
+
+        if !isnothing(method_idx)
+            push!(events, Events.RequestReceived(sid, headers, priority))
+        elseif !isnothing(status_idx)
+            status_val = headers[status_idx].second
+            if occursin(r"^1\d\d$", status_val)
+                push!(events, Events.InformationalResponseReceived(sid, headers))
+            else
+                push!(events, Events.ResponseReceived(sid, headers))
+            end
+        else
+            push!(events, Events.RequestReceived(sid, headers, priority))
+        end
+        if frame.end_stream
+            push!(events, Events.StreamEnded(sid))
+            stream.state = :half_closed_remote
+        end
+        return events
+
+    elseif frame isa H2Frames.WindowUpdateFrame
+        increment = UInt32(frame.window_size_increment)
+        if increment == 0
+            reset_frame = H2Frames.RstStreamFrame(sid, PROTOCOL_ERROR)
+            write(conn.outbound_buffer, H2Frames.serialize_frame(reset_frame))
+            return nothing
+        end
+        
+        new_window = stream.send_window + increment
+        if new_window > 2^31 - 1
+            reset_frame = H2Frames.RstStreamFrame(sid, FLOW_CONTROL_ERROR)
+            write(conn.outbound_buffer, H2Frames.serialize_frame(reset_frame))
+            return nothing
+        end
+        stream.send_window = new_window
+        return [Events.WindowUpdated(sid, increment)]
+
+    elseif frame isa H2Frames.RstStreamFrame
+        error_code = UInt32(frame.error_code)
+        stream.state = :closed
+        return [Events.StreamReset(sid, error_code)]
+
+    elseif frame isa H2Frames.PriorityFrame
+        if frame.stream_dependency == sid
+            throw(ProtocolError("Stream $sid cannot depend on itself"))
+        end
+        priority = Events.Priority(UInt32(frame.stream_dependency), UInt8(frame.weight), frame.exclusive)
+        stream.priority = priority
+        return [Events.PriorityChanged(sid, priority)]
+    end
+
+    return nothing
+end
+
+
+"""
+    prioritize!(conn::H2Connection, stream_id::UInt32;
+                weight::Int=16, depends_on::UInt32=0, exclusive::Bool=false)
+
+Updates the server about the priority of a stream.
+
+# Arguments
+- `conn::H2Connection`: The connection
+- `stream_id::UInt32`: The stream ID to prioritize
+- `weight::Int=16`: Priority weight (1-256)
+- `depends_on::Integer=0`: Stream ID this stream depends on
+- `exclusive::Bool=false`: Whether this is an exclusive dependency
+
+# Usage
+```julia
+# Set high priority
+prioritize!(conn, UInt32(1), weight=256, depends_on=UInt32(0), exclusive=true)
+
+# Set low priority depending on another stream
+prioritize!(conn, UInt32(3), weight=1, depends_on=UInt32(1), exclusive=false)
+```
+"""
+function prioritize!(conn::H2Connection, stream_id::UInt32;
+                     weight::Int=16, depends_on::Integer=0, exclusive::Bool=false)
+    
+    if !(1 <= weight <= 256)
+        throw(ArgumentError("Weight must be between 1 and 256"))
+    end
+    if depends_on == stream_id
+        throw(H2Exceptions.ProtocolError("A stream cannot depend on itself"))
+    end
+    
+    priority_frame = H2Frames.PriorityFrame(Int(stream_id), exclusive, Int(depends_on), weight - 1)
+    
+    serialized_bytes = H2Frames.serialize_frame(priority_frame)
+    write(conn.outbound_buffer, serialized_bytes)
+    
+    @debug "Queued PRIORITY frame for stream $stream_id"
+end
+
+"""
+    send_headers(conn::H2Connection, stream_id::UInt32, headers; 
+                 end_stream=false, priority_weight=nothing, 
+                 priority_depends_on=nothing, priority_exclusive=nothing)
+
+Sends HTTP headers on a stream.
+
+# Arguments
+- `conn::H2Connection`: The connection
+- `stream_id::UInt32`: The stream ID
+- `headers`: Vector of header pairs or any iterable of pairs
+- `end_stream::Bool=false`: Whether this closes the stream
+- `priority_weight::Union{Int, Nothing}=nothing`: Priority weight (1-256)
+- `priority_depends_on::Union{Integer, Nothing}=nothing`: Stream dependency
+- `priority_exclusive::Union{Bool, Nothing}=nothing`: Exclusive dependency
+
+# Usage
+```julia
+# Send request headers
+headers = [":method" => "GET", ":path" => "/", ":scheme" => "https", ":authority" => "example.com"]
+send_headers(conn, UInt32(1), headers)
+
+# Send response headers
+headers = [":status" => "200", "content-type" => "text/html"]
+send_headers(conn, UInt32(1), headers, end_stream=true)
+
+# Send headers with priority
+send_headers(conn, UInt32(3), headers, priority_weight=32, priority_depends_on=UInt32(1))
+```
+"""
+function send_headers(conn::H2Connection, stream_id::UInt32, headers; 
+                      end_stream=false, 
+                      priority_weight::Union{Int, Nothing}=nothing,
+                      priority_depends_on::Union{Integer, Nothing}=nothing,
+                      priority_exclusive::Union{Bool, Nothing}=nothing)
+    
+    @info "Queuing HEADERS for stream $stream_id"
+    Events.validate_stream_id(stream_id)
+    if conn.config.client_side && stream_id < conn.next_stream_id
+        throw(StreamIDTooLowError(stream_id, conn.next_stream_id))
+    end
+    
+    priority_info = nothing
+    if !isnothing(priority_weight) || !isnothing(priority_depends_on) || !isnothing(priority_exclusive)
+        weight = !isnothing(priority_weight) ? priority_weight : 16
+        depends_on = !isnothing(priority_depends_on) ? priority_depends_on : 0
+        exclusive = !isnothing(priority_exclusive) ? priority_exclusive : false
+
+        if !(1 <= weight <= 256) throw(ArgumentError("Weight must be between 1 and 256")) end
+        if depends_on == stream_id throw(H2Exceptions.ProtocolError("A stream cannot depend on itself")) end
+        
+        priority_info = H2Frames.Headers.PriorityInfo(exclusive, UInt32(depends_on), weight)
+    end
+
+    frame = H2Frames.create_headers_frame(Int(stream_id), headers, conn.hpack_encoder, 
+                                         end_stream=end_stream, priority_info=priority_info)
+
+    serialized_bytes = H2Frames.serialize_frame(frame)
+    write(conn.outbound_buffer, serialized_bytes)
+    
+    stream = _get_or_create_stream(conn, stream_id)
+    stream.state = end_stream ? :half_closed_local : :open
+    
+    if conn.config.client_side && stream_id >= conn.next_stream_id
+        conn.next_stream_id = stream_id + 2
+    end
+    
+    if !isnothing(priority_info)
+        stream.priority = Events.Priority(priority_info.stream_dependency, priority_info.weight, priority_info.exclusive)
     end
 end
 
-# ============================================================================= 
-# Connection State Machine 
-# ============================================================================= 
+"""
+HTTP/2 Connection Management Module
+
+This module provides functions for managing HTTP/2 connections, streams, and protocol operations.
+It handles data transmission, flow control, settings management, and connection lifecycle.
+"""
 
 """
-    transition_state!(conn::HTTP2Connection, new_state::ConnectionState)
+    send_data(conn::H2Connection, stream_id::UInt32, data::Vector{UInt8}; end_stream=false)
 
-Transition the connection to a new state, enforcing valid transitions.
-Throws if the transition is invalid.
+Sends data on a specific HTTP/2 stream with flow control validation.
+
+This function queues data to be sent on the specified stream, validates flow control limits,
+and handles frame size constraints. It automatically updates the stream's send window and
+can mark the stream as half-closed if this is the final data frame.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+- `stream_id::UInt32`: The stream identifier (must be valid)
+- `data::Vector{UInt8}`: The data bytes to send
+- `end_stream::Bool=false`: Whether this is the last data frame for the stream
+
+# Throws
+- `FlowControlError`: If data size exceeds stream's send window
+- `FrameTooLargeError`: If data size exceeds maximum frame size
+
+# Examples
+```julia
+# Send data on stream 1
+data = Vector{UInt8}("Hello, HTTP/2!")
+send_data(conn, UInt32(1), data)
+
+# Send final data frame and close stream
+send_data(conn, UInt32(1), data, end_stream=true)
+
+# Send JSON response
+json_data = Vector{UInt8}("{\"status\": \"ok\", \"data\": [1,2,3]}")
+send_data(conn, UInt32(3), json_data, end_stream=true)
+```
 """
-function transition_state!(conn::AbstractHTTP2Connection, new_state::ConnectionState)
-    @lock conn.state_lock begin
-        old_state = conn.state
-        if old_state == new_state
-            return
-        end
+function send_data(conn::H2Connection, stream_id::UInt32, data::Vector{UInt8}; end_stream=false)
+    @info "Queuing DATA for stream $stream_id"
+    Events.validate_stream_id(stream_id)
+    
+    stream = _get_or_create_stream(conn, stream_id)
+    if length(data) > stream.send_window
+        throw(H2Exceptions.FlowControlError("Data size $(length(data)) exceeds stream window $(stream.send_window)"))
+    end
 
-        if !is_valid_transition(Val(old_state), Val(new_state))
-            throw(ProtocolError("Invalid connection state transition: $old_state → $new_state"))
+    max_frame_size = get(conn.remote_settings, SETTINGS_MAX_FRAME_SIZE, UInt32(16384))
+    if length(data) > max_frame_size
+        throw(FrameTooLargeError("Data size $(length(data)) exceeds max frame size $(max_frame_size)"))
+    end
+    
+    frames = H2Frames.create_data_frame(Int(stream_id), data; end_stream=end_stream)
+    for frame in frames
+        serialized_bytes = H2Frames.serialize_frame(frame)
+        write(conn.outbound_buffer, serialized_bytes)
+    end
+    stream.send_window -= UInt32(length(data))
+    if end_stream
+        stream.state = :half_closed_local
+    end
+end
+
+"""
+    send_settings(conn::H2Connection, settings::Dict{Symbol, UInt32})
+
+Sends HTTP/2 settings to the peer and updates local settings.
+
+This function converts symbolic setting names to their numeric identifiers,
+creates a SETTINGS frame, and queues it for transmission. Local settings
+are immediately updated to reflect the new values.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+- `settings::Dict{Symbol, UInt32}`: Settings to send with symbol keys
+
+# Available Settings
+- `:header_table_size`: HPACK header table size
+- `:enable_push`: Enable/disable server push (0 or 1)
+- `:max_concurrent_streams`: Maximum concurrent streams
+- `:initial_window_size`: Initial flow control window size
+- `:max_frame_size`: Maximum frame size
+- `:max_header_list_size`: Maximum header list size
+
+# Examples
+```julia
+# Configure basic settings
+settings = Dict(
+    :max_concurrent_streams => UInt32(100),
+    :initial_window_size => UInt32(65535)
+)
+send_settings(conn, settings)
+
+# Configure all settings
+settings = Dict(
+    :header_table_size => UInt32(4096),
+    :enable_push => UInt32(1),
+    :max_concurrent_streams => UInt32(100),
+    :initial_window_size => UInt32(65535),
+    :max_frame_size => UInt32(16384),
+    :max_header_list_size => UInt32(8192)
+)
+send_settings(conn, settings)
+
+# Disable server push
+send_settings(conn, Dict(:enable_push => UInt32(0)))
+```
+"""
+function send_settings(conn::H2Connection, settings::Dict{Symbol, UInt32})
+    settings_dict = Dict{UInt16, UInt32}(
+        UInt16(H2Frames.setting_from_symbol(k)) => v for (k, v) in settings
+    )
+    
+    frame = H2Frames.SettingsFrame(settings_dict)
+    serialized_bytes = H2Frames.serialize_frame(frame)
+    write(conn.outbound_buffer, serialized_bytes)
+    
+    # Update local settings
+    merge!(conn.local_settings, settings)
+end
+
+"""
+    send_ping(conn::H2Connection, data::Vector{UInt8} = rand(UInt8, 8))
+
+Sends a PING frame for connection health checking and round-trip time measurement.
+
+PING frames are used to test the connection's liveness and measure round-trip time.
+The peer should respond with a PING frame containing the same 8-byte payload.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+- `data::Vector{UInt8}`: 8-byte ping payload (default: random bytes)
+
+# Throws
+- `ArgumentError`: If data is not exactly 8 bytes
+
+# Examples
+```julia
+# Send ping with random data
+send_ping(conn)
+
+# Send ping with specific data for RTT measurement
+ping_data = Vector{UInt8}([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
+send_ping(conn, ping_data)
+
+# Send ping with timestamp for precise RTT
+timestamp = reinterpret(UInt8, [time_ns()])
+send_ping(conn, timestamp[1:8])
+```
+"""
+function send_ping(conn::H2Connection, data::Vector{UInt8} = rand(UInt8, 8))
+    if length(data) != 8
+        throw(ArgumentError("PING data must be exactly 8 bytes"))
+    end
+    
+    ping_frame = H2Frames.create_ping_frame(data)
+    serialized_bytes = H2Frames.serialize_frame(ping_frame)
+    write(conn.outbound_buffer, serialized_bytes)
+end
+
+"""
+    send_goaway(conn::H2Connection, last_stream_id::UInt32, error_code::UInt32, debug_data::Vector{UInt8} = UInt8[])
+
+Gracefully terminates the HTTP/2 connection with optional debug information.
+
+GOAWAY frames are used to initiate connection shutdown or signal serious error conditions.
+After sending GOAWAY, no new streams should be created, but existing streams can complete.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+- `last_stream_id::UInt32`: Highest stream ID that will be processed
+- `error_code::UInt32`: Error code indicating termination reason
+- `debug_data::Vector{UInt8}`: Optional debug information (default: empty)
+
+# Common Error Codes
+- `0x00`: NO_ERROR - Graceful shutdown
+- `0x01`: PROTOCOL_ERROR - Protocol violation
+- `0x02`: INTERNAL_ERROR - Internal error
+- `0x03`: FLOW_CONTROL_ERROR - Flow control violation
+- `0x04`: SETTINGS_TIMEOUT - Settings timeout
+- `0x05`: STREAM_CLOSED - Frame on closed stream
+- `0x06`: FRAME_SIZE_ERROR - Frame size error
+- `0x07`: REFUSED_STREAM - Stream refused
+- `0x08`: CANCEL - Stream cancelled
+- `0x09`: COMPRESSION_ERROR - Compression error
+- `0x0A`: CONNECT_ERROR - Connection error
+- `0x0B`: ENHANCE_YOUR_CALM - Excessive resource use
+- `0x0C`: INADEQUATE_SECURITY - Inadequate security
+- `0x0D`: HTTP_1_1_REQUIRED - HTTP/1.1 required
+
+# Examples
+```julia
+# Graceful shutdown
+send_goaway(conn, UInt32(5), UInt32(0x00))
+
+# Send GOAWAY due to protocol error
+send_goaway(conn, UInt32(3), UInt32(0x01))
+
+# Send GOAWAY with debug info
+debug_info = Vector{UInt8}("Connection timeout after 30 seconds")
+send_goaway(conn, UInt32(7), UInt32(0x02), debug_info)
+
+# Enhanced your calm (rate limiting)
+send_goaway(conn, UInt32(1), UInt32(0x0B), Vector{UInt8}("Rate limit exceeded"))
+```
+"""
+function send_goaway(conn::H2Connection, last_stream_id::UInt32, error_code::UInt32, 
+                    debug_data::Vector{UInt8} = UInt8[])
+    Events.validate_stream_id(last_stream_id)
+    Events.validate_error_code(error_code)
+    
+    goaway_frame = H2Frames.create_goaway_frame(Int(last_stream_id), Int(error_code), debug_data)
+    serialized_bytes = H2Frames.serialize_frame(goaway_frame)
+    write(conn.outbound_buffer, serialized_bytes)
+end
+
+"""
+    send_rst_stream(conn::H2Connection, stream_id::UInt32, error_code::UInt32)
+
+Terminates a specific stream immediately with an error code.
+
+RST_STREAM frames are used to abnormally terminate a stream. Unlike GOAWAY,
+this affects only a single stream and allows the connection to continue.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+- `stream_id::UInt32`: The stream to terminate
+- `error_code::UInt32`: Error code for termination reason
+
+# Common Error Codes
+- `0x00`: NO_ERROR - No error
+- `0x01`: PROTOCOL_ERROR - Protocol violation
+- `0x02`: INTERNAL_ERROR - Internal error
+- `0x03`: FLOW_CONTROL_ERROR - Flow control violation
+- `0x04`: SETTINGS_TIMEOUT - Settings timeout
+- `0x05`: STREAM_CLOSED - Stream was closed
+- `0x06`: FRAME_SIZE_ERROR - Frame size error
+- `0x07`: REFUSED_STREAM - Stream refused before processing
+- `0x08`: CANCEL - Stream cancelled by user
+- `0x09`: COMPRESSION_ERROR - Compression error
+- `0x0A`: CONNECT_ERROR - Connection error for CONNECT method
+- `0x0B`: ENHANCE_YOUR_CALM - Excessive resource use
+- `0x0C`: INADEQUATE_SECURITY - Inadequate security
+- `0x0D`: HTTP_1_1_REQUIRED - HTTP/1.1 required
+
+# Examples
+```julia
+# Cancel a stream (user requested)
+send_rst_stream(conn, UInt32(3), UInt32(0x08))
+
+# Refuse a stream due to resource limits
+send_rst_stream(conn, UInt32(5), UInt32(0x07))
+
+# Reset due to protocol error
+send_rst_stream(conn, UInt32(1), UInt32(0x01))
+
+# Reset due to flow control violation
+send_rst_stream(conn, UInt32(7), UInt32(0x03))
+```
+"""
+function send_rst_stream(conn::H2Connection, stream_id::UInt32, error_code::UInt32)
+    Events.validate_stream_id(stream_id)
+    Events.validate_error_code(error_code)
+    
+    rst_frame = H2Frames.create_rst_stream_frame(Int(stream_id), Int(error_code))
+    serialized_bytes = H2Frames.serialize_frame(rst_frame)
+    write(conn.outbound_buffer, serialized_bytes)
+    
+    if haskey(conn.streams, stream_id)
+        conn.streams[stream_id].state = :closed
+    end
+end
+
+"""
+    data_to_send(conn::H2Connection)::Vector{UInt8}
+
+Retrieves all queued outbound data for network transmission.
+
+This function empties the outbound buffer and returns all serialized frames
+that are ready to be sent over the network connection. This should be called
+after performing operations that queue frames for transmission.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+
+# Returns
+- `Vector{UInt8}`: Serialized frames ready for network transmission
+
+# Examples
+```julia
+# Send data and retrieve outbound bytes
+send_data(conn, UInt32(1), Vector{UInt8}("Hello"))
+outbound_data = data_to_send(conn)
+if !isempty(outbound_data)
+    write(socket, outbound_data)
+end
+
+# Process multiple operations and send all at once
+send_settings(conn, Dict(:max_concurrent_streams => UInt32(100)))
+send_ping(conn)
+send_data(conn, UInt32(3), Vector{UInt8}("Response data"))
+
+# Get all queued frames
+all_frames = data_to_send(conn)
+write(socket, all_frames)
+
+# Check if there's data to send
+if !isempty(data_to_send(conn))
+    # Handle transmission
+end
+```
+"""
+function data_to_send(conn::H2Connection)::Vector{UInt8}
+    data = take!(conn.outbound_buffer)
+    @debug "Dequeuing $(length(data)) bytes to send."
+    return data
+end
+
+"""
+    _get_stream(conn::H2Connection, stream_id::UInt32; can_create::Bool=false)
+
+Retrieves an existing stream or optionally creates a new one.
+
+This is an internal function used to access stream objects. It can optionally
+create a new stream if it doesn't exist and can_create is true.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+- `stream_id::UInt32`: The stream identifier
+- `can_create::Bool=false`: Whether to create stream if it doesn't exist
+
+# Returns
+- `H2Stream` or `nothing`: The stream object if found/created, nothing otherwise
+
+# Examples
+```julia
+# Get existing stream (returns nothing if not found)
+stream = _get_stream(conn, UInt32(1))
+if isnothing(stream)
+    println("Stream 1 does not exist")
+end
+
+# Get stream and create if needed
+stream = _get_stream(conn, UInt32(3), can_create=true)
+
+# Check stream existence
+existing_stream = _get_stream(conn, UInt32(5))
+if !isnothing(existing_stream)
+    println("Stream 5 exists with state: \$(existing_stream.state)")
+end
+```
+"""
+function _get_stream(conn::H2Connection, stream_id::UInt32; can_create::Bool=false)
+    if haskey(conn.streams, stream_id)
+        return conn.streams[stream_id]
+    elseif can_create
+        return _get_or_create_stream(conn, stream_id)
+    else
+        return nothing
+    end
+end
+
+"""
+    _get_or_create_stream(conn::H2Connection, stream_id::UInt32)
+
+Gets an existing stream or creates a new one with proper initialization.
+
+This function ensures that a stream exists, creating it if necessary. It validates
+stream limits, initializes flow control windows, and sets appropriate initial state.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+- `stream_id::UInt32`: The stream identifier
+
+# Returns
+- `H2Stream`: The stream object (existing or newly created)
+
+# Throws
+- `TooManyStreamsError`: If creating the stream would exceed concurrent stream limits
+
+# Examples
+```julia
+# Get or create stream 1
+stream = _get_or_create_stream(conn, UInt32(1))
+println("Stream 1 state: \$(stream.state)")
+
+# Create multiple streams
+for i in 1:2:10  # Client streams (odd numbers)
+    stream = _get_or_create_stream(conn, UInt32(i))
+    println("Created stream \$i")
+end
+
+# Handle stream creation with error handling
+try
+    stream = _get_or_create_stream(conn, UInt32(101))
+catch e
+    if e isa TooManyStreamsError
+        println("Cannot create stream: \$(e.message)")
+    end
+end
+```
+"""
+function _get_or_create_stream(conn::H2Connection, stream_id::UInt32)
+    if !haskey(conn.streams, stream_id)
+        max_streams = get(conn.local_settings, SETTINGS_MAX_CONCURRENT_STREAMS, typemax(UInt32))
+        stream_type_is_client = conn.config.client_side ? (stream_id % 2 != 0) : (stream_id % 2 == 0)
+        
+        if stream_type_is_client
+        else
+            inbound_streams = count(s -> !conn.config.client_side ? (s % 2 != 0) : (s % 2 == 0) && conn.streams[s].state != :closed, keys(conn.streams))
+            if inbound_streams >= max_streams
+                throw(TooManyStreamsError("Peer tried to open stream $stream_id, exceeding limit of $max_streams"))
+            end
         end
         
-        @debug "State Transition: $old_state → $new_state"
-        conn.state = new_state
+        @info "Creating new stream: $stream_id"
+        # ---> CORRECTION: Using the ENUM
+        initial_window = get(conn.remote_settings, SETTINGS_INITIAL_WINDOW_SIZE, UInt32(65535))
+        conn.streams[stream_id] = H2Stream(stream_id, :idle, initial_window, initial_window)
+        conn.last_processed_stream_id = max(conn.last_processed_stream_id, stream_id)
     end
-    end
-
-is_valid_transition(from::ConnectionState, to::ConnectionState) = false
-
-is_valid_transition(::Val{CONNECTION_IDLE}, ::Val{CONNECTION_OPEN}) = true
-is_valid_transition(::Val{CONNECTION_IDLE}, ::Val{CONNECTION_CLOSED}) = true
-is_valid_transition(::Val{CONNECTION_IDLE}, ::Val{CONNECTION_GOAWAY_SENT}) = true
-
-# Από κατάσταση OPEN
-is_valid_transition(::Val{CONNECTION_OPEN}, ::Val{CONNECTION_CLOSING}) = true
-is_valid_transition(::Val{CONNECTION_OPEN}, ::Val{CONNECTION_GOAWAY_SENT}) = true
-is_valid_transition(::Val{CONNECTION_OPEN}, ::Val{CONNECTION_GOAWAY_RECEIVED}) = true
-is_valid_transition(::Val{CONNECTION_OPEN}, ::Val{CONNECTION_CLOSED}) = true
-
-# Από κατάσταση CLOSING
-is_valid_transition(::Val{CONNECTION_CLOSING}, ::Val{CONNECTION_CLOSED}) = true
-
-# Από κατάσταση GOAWAY_SENT
-is_valid_transition(::Val{CONNECTION_GOAWAY_SENT}, ::Val{CONNECTION_CLOSING}) = true
-is_valid_transition(::Val{CONNECTION_GOAWAY_SENT}, ::Val{CONNECTION_CLOSED}) = true
-is_valid_transition(::Val{CONNECTION_GOAWAY_SENT}, ::Val{CONNECTION_GOAWAY_RECEIVED}) = true
-
-# Από κατάσταση GOAWAY_RECEIVED
-is_valid_transition(::Val{CONNECTION_GOAWAY_RECEIVED}, ::Val{CONNECTION_CLOSING}) = true
-is_valid_transition(::Val{CONNECTION_GOAWAY_RECEIVED}, ::Val{CONNECTION_CLOSED}) = true
-
+    return conn.streams[stream_id]
+end
 
 """
-    send_frame(conn::HTTP2Connection, frame_bytes::Vector{UInt8})
+    acknowledge_received_data!(conn::H2Connection, stream_id::UInt32, size::UInt32)
 
-Writes a pre-serialized frame (as bytes) to the connection's socket.
-This is the lowest-level sending function.
+Processes received data and sends WINDOW_UPDATE frames when necessary.
+
+This function handles flow control for received data by updating both stream-level
+and connection-level flow control windows. It automatically sends WINDOW_UPDATE
+frames when thresholds are met to allow the peer to send more data.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+- `stream_id::UInt32`: The stream that received data
+- `size::UInt32`: Number of bytes received
+
+# Examples
+```julia
+# Acknowledge 1024 bytes received on stream 1
+acknowledge_received_data!(conn, UInt32(1), UInt32(1024))
+
+# Process received HTTP response
+response_size = UInt32(2048)
+acknowledge_received_data!(conn, UInt32(3), response_size)
+
+# Handle large data reception
+chunk_size = UInt32(8192)
+acknowledge_received_data!(conn, UInt32(5), chunk_size)
+
+# Get any window updates to send
+window_updates = data_to_send(conn)
+if !isempty(window_updates)
+    write(socket, window_updates)
+end
+```
 """
-function send_frame(conn::HTTP2Connection, frame_bytes::Vector{UInt8})
-    if is_closed(conn)
-        return
+function acknowledge_received_data!(conn::H2Connection, stream_id::UInt32, size::UInt32)
+    Events.validate_stream_id(stream_id)
+
+    stream = _get_stream(conn, stream_id)
+    if isnothing(stream) return end 
+    
+    stream_increment = process_bytes!(stream.inbound_window_manager, size)
+    if !isnothing(stream_increment) && stream_increment > 0
+        update_frame = H2Frames.WindowUpdateFrame(Int(stream_id), Int(stream_increment))
+        write(conn.outbound_buffer, H2Frames.serialize_frame(update_frame))
+        @debug "Queued WINDOW_UPDATE for stream $stream_id, increment $stream_increment."
     end
+
+    conn_increment = process_bytes!(conn.inbound_window_manager, size)
+    if !isnothing(conn_increment) && conn_increment > 0
+        update_frame = H2Frames.WindowUpdateFrame(0, Int(conn_increment))
+        write(conn.outbound_buffer, H2Frames.serialize_frame(update_frame))
+        @debug "Queued WINDOW_UPDATE for connection, increment $conn_increment."
+    end
+end
+
+"""
+    get_stream_state(conn::H2Connection, stream_id::UInt32)
+
+Returns the current state of a stream.
+
+HTTP/2 streams have a defined lifecycle with specific states. This function
+provides the current state of a stream, which is useful for determining
+what operations are valid.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+- `stream_id::UInt32`: The stream identifier
+
+# Returns
+- `Symbol`: Stream state (`:idle`, `:open`, `:half_closed_local`, `:half_closed_remote`, `:closed`)
+
+# Stream States
+- `:idle`: Stream has not been used yet
+- `:open`: Stream is active and can send/receive data
+- `:half_closed_local`: Local side has finished sending
+- `:half_closed_remote`: Remote side has finished sending
+- `:closed`: Stream is completely closed
+
+# Examples
+```julia
+# Check stream state before sending data
+state = get_stream_state(conn, UInt32(1))
+if state == :open || state == :half_closed_remote
+    send_data(conn, UInt32(1), data)
+else
+    println("Cannot send data on stream in state: \$state")
+end
+
+# Monitor stream lifecycle
+stream_id = UInt32(3)
+println("Stream \$stream_id state: \$(get_stream_state(conn, stream_id))")
+
+# Check multiple streams
+for id in [1, 3, 5, 7]
+    state = get_stream_state(conn, UInt32(id))
+    println("Stream \$id: \$state")
+end
+```
+"""
+function get_stream_state(conn::H2Connection, stream_id::UInt32)
+    stream = get(conn.streams, stream_id, nothing)
+    return isnothing(stream) ? :idle : stream.state
+end
+
+"""
+    get_stream_priority(conn::H2Connection, stream_id::UInt32)
+
+Returns the priority information for a stream.
+
+HTTP/2 supports stream prioritization to optimize resource allocation.
+This function retrieves the priority settings for a stream if it exists.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+- `stream_id::UInt32`: The stream identifier
+
+# Returns
+- Priority object or `nothing`: Priority information if stream exists, nothing otherwise
+
+# Examples
+```julia
+# Get priority for a stream
+priority = get_stream_priority(conn, UInt32(1))
+if !isnothing(priority)
+    println("Stream 1 priority: \$priority")
+else
+    println("Stream 1 has no priority information")
+end
+
+# Check priorities for multiple streams
+for id in [1, 3, 5]
+    priority = get_stream_priority(conn, UInt32(id))
+    if !isnothing(priority)
+        println("Stream \$id priority: \$priority")
+    end
+end
+```
+"""
+function get_stream_priority(conn::H2Connection, stream_id::UInt32)
+    stream = get(conn.streams, stream_id, nothing)
+    return isnothing(stream) ? nothing : stream.priority
+end
+
+"""
+    connection_summary(conn::H2Connection)
+
+Returns a formatted summary of the connection state.
+
+This function provides a comprehensive overview of the HTTP/2 connection,
+including configuration, active streams, and current settings. Useful
+for debugging and monitoring.
+
+# Arguments
+- `conn::H2Connection`: The HTTP/2 connection object
+
+# Returns
+- `String`: Formatted connection summary
+
+# Examples
+```julia
+# Get connection summary
+summary = connection_summary(conn)
+println(summary)
+
+# Log connection state periodically
+@info connection_summary(conn)
+
+# Include in debug output
+function debug_connection(conn)
+    println("=== Connection Debug Info ===")
+    println(connection_summary(conn))
+    println("=============================")
+end
+```
+"""
+function connection_summary(conn::H2Connection)
+    return """
+    H2Connection Summary:
+    - Client: $(conn.config.client_side)
+    - Active streams: $(length(conn.streams))
+    - Next stream ID: $(conn.next_stream_id)
+    - Connection window: $(conn.connection_window)
+    - Local settings: $(conn.local_settings)
+    - Remote settings: $(conn.remote_settings)
+    """
+end
+
+"""
+    _validate_received_headers(headers::Vector{Pair{String, String}})
+
+Validates HTTP/2 header compliance according to RFC 7540.
+
+HTTP/2 has specific rules for headers that differ from HTTP/1.1. This function
+ensures that received headers conform to HTTP/2 requirements.
+
+# Arguments
+- `headers::Vector{Pair{String, String}}`: Headers to validate
+
+# Throws
+- `ProtocolError`: If headers violate HTTP/2 rules
+
+# Validation Rules
+- Header names must be lowercase
+- Connection-specific headers are forbidden
+- Certain HTTP/1.1 headers are not allowed
+
+# Examples
+```julia
+# Validate compliant headers
+headers = [
+    "content-type" => "application/json",
+    "content-length" => "100",
+    ":method" => "GET",
+    ":path" => "/api/data"
+]
+_validate_received_headers(headers)
+
+# This would throw ProtocolError
+bad_headers = [
+    "Content-Type" => "text/html",  # Uppercase not allowed
+    "Connection" => "close"         # Connection header forbidden
+]
+try
+    _validate_received_headers(bad_headers)
+catch e
+    println("Header validation failed: \$(e.message)")
+end
+
+# Validate headers from incoming request
+function process_request_headers(headers)
     try
-        @lock conn.socket_lock begin # <-- Use the new socket_lock
-            write(conn.socket, frame_bytes)
-            flush(conn.socket)
-        end
+        _validate_received_headers(headers)
+        # Process valid headers
     catch e
-        handle_connection_error!(conn, :INTERNAL_ERROR, "Socket write failure: $e")
+        send_rst_stream(conn, stream_id, UInt32(0x01))  # PROTOCOL_ERROR
     end
 end
-
-
-
-
-
+```
 """
-    send_goaway!(conn::HTTP2Connection, error_code::Symbol=:NO_ERROR, msg::AbstractString="")
-
-Send a GOAWAY frame and transition to GOAWAY_SENT.
-"""
-function send_goaway!(conn::HTTP2Connection, error_code::Symbol=:NO_ERROR, msg::AbstractString="")
-    if conn.state in (CONNECTION_CLOSED, CONNECTION_GOAWAY_SENT)
-        return
-    end
-    @lock conn.state_lock begin
-        goaway = GoAwayFrame(conn.last_peer_stream_id, error_code, Vector{UInt8}(msg))
-        send_frame(conn, serialize_payload(goaway))
-        conn.goaway_sent = true
-        transition_state!(conn, CONNECTION_GOAWAY_SENT)
-    end
-end
-
-"""
-    receive_goaway!(conn::HTTP2Connection, last_stream_id::UInt32, error_code::Symbol, debug_data::Vector{UInt8})
-
-Handle receipt of a GOAWAY frame and transition to GOAWAY_RECEIVED.
-"""
-function receive_goaway!(conn::HTTP2Connection, last_stream_id::UInt32, error_code::Symbol, debug_data::Vector{UInt8})
-    if conn.state in (CONNECTION_CLOSED, CONNECTION_GOAWAY_RECEIVED)
-        return
-    end
-    conn.goaway_received = true
-    conn.last_peer_stream_id = last_stream_id
-    transition_state!(conn, CONNECTION_GOAWAY_RECEIVED)
-    # Optionally, close streams with id > last_stream_id
-    for (sid, stream) in conn.streams
-        if sid > last_stream_id
-            close_stream(stream, error_code)
-            delete!(conn.streams, sid)
+function _validate_received_headers(headers::Vector{Pair{String, String}})
+    connection_specific = ["Connection", "Proxy-Connection", "Keep-Alive", "Transfer-Encoding", "Upgrade"]
+    for (name, value) in headers
+        if name != lowercase(name)
+            throw(H2Exceptions.ProtocolError("Received uppercase header name: $name"))
+        end
+        if name in connection_specific
+            throw(H2Exceptions.ProtocolError("Received connection-specific header: $name"))
         end
     end
 end
 
-
 """
-    can_send_frame(conn::HTTP2Connection) -> Bool
+    _validate_setting(conn::H2Connection, key::UInt16, value::UInt32)
 
-Return true if the connection is in a state where H2Frames can be sent.
-"""
-can_send_frame(conn::HTTP2Connection) = conn.state in (ConnectionState.connOpen, ConnectionState.connGoawaySent, ConnectionState.connGoawayReceived)
+Validates HTTP/2 setting values according to specification limits.
 
-"""
-    can_receive_frame(conn::HTTP2Connection) -> Bool
+HTTP/2 settings have specific valid ranges and constraints. This function
+ensures that setting values are within acceptable limits before applying them.
 
-Return true if the connection is in a state where H2Frames can be received.
-"""
-can_receive_frame(conn::HTTP2Connection) = conn.state in (ConnectionState.connOpen, ConnectionState.connGoawaySent, ConnectionState.connGoawayReceived)
+# Arguments
+- `conn::H2Connection`: The connection object
+- `key::UInt16`: Setting identifier
+- `value::UInt32`: Setting value to validate
 
+# Throws
+- `InvalidSettingsValueError`: If setting value is invalid
 
+# Validated Settings
+- `SETTINGS_ENABLE_PUSH`: Must be 0 or 1
+- `SETTINGS_INITIAL_WINDOW_SIZE`: Must not exceed 2^31 - 1
+- `SETTINGS_MAX_FRAME_SIZE`: Must be between 2^14 and 2^24 - 1
 
-# Pretty print for debugging
-function Base.show(io::IO, ::MIME"text/plain", state::ConnectionState)
-    println(io, "HTTP/2 Connection State: $(state)")
+# Examples
+```julia
+# Validate enable push setting
+try
+    _validate_setting(conn, H2Frames.SETTINGS_ENABLE_PUSH, UInt32(1))
+    println("Valid ENABLE_PUSH setting")
+catch e
+    println("Invalid setting: \$(e.message)")
 end
 
+# Validate window size
+try
+    _validate_setting(conn, H2Frames.SETTINGS_INITIAL_WINDOW_SIZE, UInt32(65535))
+    println("Valid window size")
+catch e
+    println("Invalid window size: \$(e.message)")
 end
 
+# Validate frame size
+try
+    _validate_setting(conn, H2Frames.SETTINGS_MAX_FRAME_SIZE, UInt32(32768))
+    println("Valid frame size")
+catch e
+    println("Invalid frame size: \$(e.message)")
+end
+
+# Use in settings processing
+function process_received_settings(conn, settings)
+    for (key, value) in settings
+        try
+            _validate_setting(conn, key, value)
+            # Apply valid setting
+        catch e
+            send_goaway(conn, UInt32(0), UInt32(0x01))  # PROTOCOL_ERROR
+            return
+        end
+    end
+end
+```
+"""
+function _validate_setting(conn::H2Connection, key::UInt16, value::UInt32)
+    if key == H2Frames.SETTINGS_ENABLE_PUSH && !(value in [0, 1])
+        throw(InvalidSettingsValueError("ENABLE_PUSH must be 0 or 1", PROTOCOL_ERROR))
+    elseif key == H2Frames.SETTINGS_INITIAL_WINDOW_SIZE && value > 2^31 - 1
+        throw(InvalidSettingsValueError("INITIAL_WINDOW_SIZE exceeds maximum value", FLOW_CONTROL_ERROR))
+    elseif key == H2Frames.SETTINGS_MAX_FRAME_SIZE && !(16384 <= value <= 16777215)
+        throw(InvalidSettingsValueError("MAX_FRAME_SIZE must be between 2^14 and 2^24-1", PROTOCOL_ERROR))
+    end
+end
+end # module Connection
