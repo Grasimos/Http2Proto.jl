@@ -1,92 +1,55 @@
 module H2
 
-using HPACK
-using H2Frames
+include("Η2Errors.jl") 
+include("Η2Exceptions.jl")
+include("H2Settings.jl")
+include("Config.jl")
+include("Windows.jl")
+include("Events.jl") 
+include("Connection.jl")
 
-include("Exc.jl");using ..Exc
-include("H2Settings.jl");using ..H2Settings
-include("RateLimiter.jl");using ..RateLimiter
-# include("BufferManager.jl");using ..BufferManager
-include("H2Types.jl");using ..H2Types
-include("Streams.jl");using ..Streams
-include("Connection.jl");using ..Connection
-include("H2TLSIntegration.jl");using ..H2TLSIntegration
-include("H2Client.jl");using ..H2Client
-include("H2Server.jl");using ..H2Server
-include("HTTPRouterAdapter.jl");using ..HTTPRouterAdapter
-
-
-# ========================
-#        PUBLIC API) 
-# ========================
-"""
-    connect(host, port; kwargs...) -> HTTP2Client
-
-Establishes a client connection. This is the public API.
-"""
-connect(host::String, port::Integer; kwargs...) = H2Client.connect(host, port; kwargs...)
-
-"""
-    request(client::HTTP2Client, method::String, path::String; kwargs...) -> HTTP2Response
-
-Sends a request on an established client connection. This is the public API.
-"""
-request(client::H2Client.HTTP2Client, method::String, path::String; kwargs...) = H2Client.request(client, method, path; kwargs...)
-
-"""
-    serve(handler, host, port; kwargs...)
-
-Starts the HTTP/2 server. This is the public API.
-"""
-serve(handler, host::String, port::Integer; kwargs...) = H2Server.serve(handler, host, port; kwargs...)
-
-"""
-    push_promise!(stream::HTTP2Stream, request_headers, response)
-
-Initiates a server push on the given stream.
-"""
-push_promise!(conn::HTTP2Connection, stream::HTTP2Stream, args...; kwargs...) = H2Server.push_promise!(conn, stream, args...; kwargs...)
-
-"""
-    ping(client::HTTP2Client; kwargs...) -> Float64
-
-Sends a PING and returns the round-trip time in seconds.
-"""
-ping(client::H2Client.HTTP2Client; kwargs...) = H2Client.ping(client; kwargs...)
-
-"""
-    close(obj::Union{HTTP2Client, HTTP2Server})
-
-Closes a client or server object.
-"""
-close(obj::H2Client.HTTP2Client) = H2Client.close(obj)
-close(obj::H2Server.HTTP2Server) = H2Server.close(obj)
+using .H2Errors
+using .H2Exceptions
+using .Events
+using .H2Settings
+using .Config
+using .H2Windows
+using .Connection: H2Connection, send_headers, send_data,
+ data_to_send, receive_data!, send_settings, acknowledge_received_data!, initiate_connection!, prioritize!
 
 
-export
-    # Client API
-    connect,
-    request,
-    close,
-    ping,
-    
-    # Server API
-    serve,
-    push_promise!,
+export Settings, ChangedSetting
+export H2Config
+export H2Connection, send_headers, send_data, data_to_send, receive_data!, send_settings,
+       Event, RequestReceived, ResponseReceived, DataReceived, StreamEnded,
+       SettingsChanged, WindowUpdated, StreamReset, ConnectionTerminated
 
-    # Adapters & Handlers
-    H2Router,
+export H2Error,
+       ProtocolError,
+       FrameTooLargeError,
+       FrameDataMissingError,
+       TooManyStreamsError,
+       FlowControlError,
+       StreamIDTooLowError,
+       NoAvailableStreamIDError,
+       NoSuchStreamError,
+       StreamClosedError,
+       InvalidSettingsValueError,
+       InvalidBodyLengthError,
+       UnsupportedFrameError,
+       DenialOfServiceError,
+       RFC1122Error
 
-    # Core Types
-    HTTP2Client,
-    HTTP2Server,
-    HTTP2Connection,
-    HTTP2Stream,
-    HTTP2Settings,
-    HTTP2Request,
-    HTTP2Response,
+export ERROR_CODES, error_code_name,
+       NO_ERROR, PROTOCOL_ERROR, INTERNAL_ERROR, FLOW_CONTROL_ERROR,
+       SETTINGS_TIMEOUT, STREAM_CLOSED, FRAME_SIZE_ERROR, REFUSED_STREAM,
+       CANCEL, COMPRESSION_ERROR, CONNECT_ERROR, ENHANCE_YOUR_CALM,
+       INADEQUATE_SECURITY, HTTP_1_1_REQUIRED
 
-    @h2log
+export WindowManager, window_consumed!, window_opened!, process_bytes!
 
+export Event, RequestReceived, ResponseReceived, DataReceived, StreamEnded,
+       SettingsChanged, WindowUpdated, StreamReset, ConnectionTerminated,
+       PriorityChanged, PingReceived, PingAck, InformationalResponseReceived, H2CUpgradeReceived
 
-end # module H2
+end 

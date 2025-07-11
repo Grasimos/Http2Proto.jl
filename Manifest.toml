@@ -1,8 +1,8 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.11.5"
+julia_version = "1.11.6"
 manifest_format = "2.0"
-project_hash = "e0103b1c3d1775fdbb8b4269f6c7917e507f0bbe"
+project_hash = "3e0094551f8bcfa70b75eef327125923ef4be7b8"
 
 [[deps.ANSIColoredPrinters]]
 git-tree-sha1 = "574baf8110975760d391c710b6341da1afa48d8c"
@@ -254,19 +254,19 @@ version = "2.2.0"
 
 [[deps.H2Frames]]
 deps = ["HPACK", "Test"]
-git-tree-sha1 = "f4d76ac8c590798de48873b98c49bd5c4e26a347"
+git-tree-sha1 = "7dbac929f7b0b04b2cb4db97a26aaa967b8d4622"
 repo-rev = "main"
 repo-url = "https://github.com/Grasimos/H2Frames.jl"
 uuid = "7468a3b7-930e-48c8-a27b-9d42b62f3d3e"
-version = "0.3.0"
+version = "0.4.2"
 
 [[deps.HPACK]]
 deps = ["Documenter", "Test"]
-git-tree-sha1 = "b4f99e9a323e1ae0cad7ff8bc353a0676c90e45a"
+git-tree-sha1 = "d4dcc7318fd6bfe43c239e79670eb2fa00099b37"
 repo-rev = "main"
 repo-url = "https://github.com/Grasimos/HPACK.jl"
 uuid = "03a3583f-3b84-4ec3-931d-7334ff455684"
-version = "0.2.1"
+version = "0.2.2"
 
 [[deps.HTTP]]
 deps = ["Base64", "CodecZlib", "ConcurrentUtilities", "Dates", "ExceptionUnwrapping", "Logging", "LoggingExtras", "MbedTLS", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "SimpleBufferStream", "Sockets", "URIs", "UUIDs"]
