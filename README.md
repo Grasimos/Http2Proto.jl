@@ -29,51 +29,26 @@ Pkg.add("H2")
 
 ## Quick Start
 
-### Client Usage
-
-```julia
-using H2
-
-# Create a client connection
-config = H2.H2Config(client_side=true)
-client_conn = H2.H2Connection(config=config)
-
-# Initiate the connection
-H2.initiate_connection!(client_conn)
-
-# Send a request
-headers = [":method" => "GET", ":path" => "/", ":authority" => "example.com", ":scheme" => "https"]
-H2.send_headers(client_conn, UInt32(1), headers, end_stream=true)
-
-# Get data to send over the network
-data_to_send = H2.data_to_send(client_conn)
-```
-
 ### Server Usage
 
-```julia
-using H2
+```bash
+# Create the directory
+mkdir -p ~/.mbedtls
 
-# Create a server connection
-config = H2.H2Config(client_side=false)
-server_conn = H2.H2Connection(config=config)
+# Generate a self-signed certificate (for testing)
+openssl req -x509 -newkey rsa:4096 -keyout ~/.mbedtls/key.pem -out ~/.mbedtls/cert.pem -days 365 -nodes
 
-# Process incoming data
-events = H2.receive_data!(server_conn, incoming_bytes)
-
-# Handle events
-for event in events
-    if event isa H2.Events.RequestReceived
-        # Process the request
-        response_headers = [":status" => "200", "content-type" => "text/html"]
-        H2.send_headers(server_conn, event.stream_id, response_headers)
-        H2.send_data(server_conn, event.stream_id, Vector{UInt8}("Hello, World!"), end_stream=true)
-    end
-end
-
-# Get response data to send
-response_data = H2.data_to_send(server_conn)
+julia --project=. examples/run_server.jl
 ```
+
+# Test the /simple endpoint
+curl -k https://127.0.0.1:8443/simple
+
+# Test the /json endpoint  
+curl -k https://127.0.0.1:8443/json
+
+# Test 404 response
+curl -k https://127.0.0.1:8443/nonexistent
 
 ## Core Components
 
