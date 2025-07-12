@@ -64,13 +64,14 @@ function handle_http2_connection(socket::IO)
     @info "Starting HTTP/2 protocol handling."
 
     # Create server-side H2Connection with proper config
-    config = H2Config(client_side=false)
+    config = H2Config(;client_side=false)
     conn = H2Connection(config=config)
     initiate_connection!(conn)
     initial_data = data_to_send(conn)
     if !isempty(initial_data)
         write(socket, initial_data)
-        @debug "Sent initial SETTINGS frame."
+        flush(socket)
+        @info "Sent initial SETTINGS frame."
     end
 
     try
@@ -80,10 +81,10 @@ function handle_http2_connection(socket::IO)
                 sleep(0.01) 
                 continue
             end
-            @debug "Received $(length(incoming_data)) bytes from peer."
+            @info "Received $(length(incoming_data)) bytes from peer."
 
             events = receive_data!(conn, incoming_data)
-            @debug "Processed $(length(events)) events."
+            @info "Processed $(length(events)) events."
 
             for event in events
                 handle_event(conn, event, socket)
@@ -91,7 +92,7 @@ function handle_http2_connection(socket::IO)
 
             bytes_to_send = data_to_send(conn)
             if !isempty(bytes_to_send)
-                @debug "Sending $(length(bytes_to_send)) bytes to peer."
+                @info "Sending $(length(bytes_to_send)) bytes to peer."
                 write(socket, bytes_to_send)
             end
         end
@@ -153,6 +154,12 @@ function _handle(conn::H2Connection, event::Events.RequestReceived, socket::IO)
 
     send_headers(conn, event.stream_id, response_headers)
     send_data(conn, event.stream_id, Vector{UInt8}(response_body), end_stream=true)
+    bytes_to_send = data_to_send(conn)
+    if !isempty(bytes_to_send)
+        write(socket, bytes_to_send)
+        flush(socket)   # <-- CRUCIAL HERE
+    end
+
 end
 
 function _handle(conn::H2Connection, event::Events.DataReceived, socket::IO)
@@ -182,7 +189,7 @@ function _handle(conn::H2Connection, event::Events.StreamReset, socket::IO)
 end
 
 function _handle(conn::H2Connection, event::Events.PingReceived, socket::IO)
-    @debug "Received PING with data: $(event.data)"
+    @info "Received PING with data: $(event.data)"
     # PING responses are handled automatically by H2Connection
 end
 
