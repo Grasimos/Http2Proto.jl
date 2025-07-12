@@ -39,7 +39,6 @@ mkdir -p ~/.mbedtls
 openssl req -x509 -newkey rsa:4096 -keyout ~/.mbedtls/key.pem -out ~/.mbedtls/cert.pem -days 365 -nodes
 
 julia --project=. examples/run_server.jl
-```
 
 # Test the /simple endpoint
 curl -k https://127.0.0.1:8443/simple
@@ -49,7 +48,7 @@ curl -k https://127.0.0.1:8443/json
 
 # Test 404 response
 curl -k https://127.0.0.1:8443/nonexistent
-
+```
 ## Core Components
 
 ### H2Connection
