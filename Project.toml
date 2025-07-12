@@ -1,7 +1,7 @@
 name = "H2"
 uuid = "398584f8-2490-4402-97df-fb572a84d8e7"
 authors = ["Gerasimos Panou <gerasimos.panou@gmail.com>"]
-version = "0.3.3"
+version = "0.3.4"
 
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"

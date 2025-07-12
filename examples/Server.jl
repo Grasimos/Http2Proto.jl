@@ -2,12 +2,15 @@ module Server
 
 using Sockets
 using Logging
+
+# Import the necessary modules and types
+using H2.Connection: H2Connection, receive_data!, send_headers, send_data, data_to_send, initiate_connection!
+using H2.Config: H2Config
+using H2.Events
 using H2Frames
 
-using ..H2
-using ..Connection
-using ..Events
-using ..H2TLSIntegration
+include("integrations/tls.jl")
+using .H2TLSIntegration
 
 const CONNECTION_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
@@ -60,24 +63,15 @@ end
 function handle_http2_connection(socket::IO)
     @info "Starting HTTP/2 protocol handling."
 
-    conn = H2Connection(client=false)
-
-    # Read and validate connection preface
-    preface = read(socket, sizeof(CONNECTION_PREFACE))
-    if String(preface) != CONNECTION_PREFACE
-        @error "Invalid HTTP/2 preface received. Closing connection."
-        close(socket)
-        return
+    # Create server-side H2Connection with proper config
+    config = H2Config(client_side=false)
+    conn = H2Connection(config=config)
+    initiate_connection!(conn)
+    initial_data = data_to_send(conn)
+    if !isempty(initial_data)
+        write(socket, initial_data)
+        @debug "Sent initial SETTINGS frame."
     end
-    @debug "Received valid HTTP/2 preface."
-
-    # Send initial SETTINGS frame
-    settings_frame = H2Frames.Frame(
-        H2Frames.Header(0, H2Frames.FRAME_TYPE_SETTINGS, 0x0, 0),
-        UInt8[]
-    )
-    write(socket, H2Frames.serialize_frame(settings_frame))
-    @debug "Sent initial SETTINGS frame."
 
     try
         while !eof(socket)
@@ -115,12 +109,12 @@ function handle_http2_connection(socket::IO)
 end
 
 """
-    handle_event(conn::H2Connection, event::Event, socket::IO)
+    handle_event(conn::H2Connection, event::Events.Event, socket::IO)
 
 Η συνάρτηση αυτή είναι ο "dispatcher". Παίρνει ένα event και αποφασίζει
 τι θα κάνει η εφαρμογή μας. Εδώ είναι η "επιχειρησιακή λογική".
 """
-function handle_event(conn::H2Connection, event::Event, socket::IO)
+function handle_event(conn::H2Connection, event::Events.Event, socket::IO)
     @info "Handling event: $(typeof(event))"
     _handle(conn, event, socket)
 end
@@ -129,7 +123,7 @@ function _handle(conn, event, socket)
     @warn "No handler for event $(typeof(event))"
 end
 
-function _handle(conn::H2Connection, event::RequestReceived, socket::IO)
+function _handle(conn::H2Connection, event::Events.RequestReceived, socket::IO)
     @info "Received request on stream $(event.stream_id): $(event.headers)"
 
     # Extract request path for routing
@@ -161,45 +155,50 @@ function _handle(conn::H2Connection, event::RequestReceived, socket::IO)
     send_data(conn, event.stream_id, Vector{UInt8}(response_body), end_stream=true)
 end
 
-function _handle(conn::H2Connection, event::DataReceived, socket::IO)
+function _handle(conn::H2Connection, event::Events.DataReceived, socket::IO)
     @info "Received $(length(event.data)) bytes of data on stream $(event.stream_id)."
     # Handle request body data if needed
     # For POST/PUT requests, accumulate the data and process when stream ends
 end
 
-function _handle(conn::H2Connection, event::StreamEnded, socket::IO)
+function _handle(conn::H2Connection, event::Events.StreamEnded, socket::IO)
     @info "Stream $(event.stream_id) ended by peer."
     # Clean up any stream-specific resources
 end
 
-function _handle(conn::H2Connection, event::SettingsChanged, socket::IO)
+function _handle(conn::H2Connection, event::Events.SettingsChanged, socket::IO)
     @info "Settings changed: $(event.changed_settings)"
     # Settings are automatically acknowledged by the H2Connection
 end
 
-function _handle(conn::H2Connection, event::PriorityChanged, socket::IO)
+function _handle(conn::H2Connection, event::Events.PriorityChanged, socket::IO)
     @info "Priority changed for stream $(event.stream_id)"
     # Handle priority changes if needed for scheduling
 end
 
-function _handle(conn::H2Connection, event::StreamReset, socket::IO)
+function _handle(conn::H2Connection, event::Events.StreamReset, socket::IO)
     @info "Stream $(event.stream_id) reset with error code $(event.error_code)"
     # Clean up any resources for the reset stream
 end
 
-function _handle(conn::H2Connection, event::PingReceived, socket::IO)
+function _handle(conn::H2Connection, event::Events.PingReceived, socket::IO)
     @debug "Received PING with data: $(event.data)"
     # PING responses are handled automatically by H2Connection
 end
 
-function _handle(conn::H2Connection, event::ConnectionTerminated, socket::IO)
+function _handle(conn::H2Connection, event::Events.ConnectionTerminated, socket::IO)
     @info "Connection terminated: last_stream_id=$(event.last_stream_id), error_code=$(event.error_code)"
     # Clean up connection resources
 end
 
-function _handle(conn::H2Connection, event::H2CUpgradeReceived, socket::IO)
+function _handle(conn::H2Connection, event::Events.H2CUpgradeReceived, socket::IO)
     @info "HTTP/1.1 to HTTP/2 upgrade received"
-    # Handle h2c upgrade if supported
+    # Handle h2c upgrade 
+end
+
+function _handle(conn::H2Connection, event::Events.WindowUpdated, socket::IO)
+    @info "Window Updated!"
+    # Handle window update 
 end
 
 end
