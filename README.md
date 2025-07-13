@@ -7,7 +7,7 @@ A comprehensive HTTP/2 protocol implementation for Julia, providing both client 
 - **Full HTTP/2 Protocol Support**: Complete implementation of RFC 7540
 - **Client and Server Modes**: Configurable for both client-side and server-side operations
 - **Stream Management**: Full support for HTTP/2 multiplexed streams
-- **Header Compression**: HPACK (HTTP/2 Header Compression) support via integrated Http2HPACK.jl
+- **Header Compression**: HPACK (HTTP/2 Header Compression) support via integrated Http2Hpack.jl
 - **Flow Control**: Automatic window management and flow control mechanisms
 - **Priority Handling**: Stream priority and dependency management
 - **Informational Responses**: Support for 1xx status codes (100 Continue, 103 Early Hints)
@@ -24,7 +24,7 @@ Pkg.add("Http2Proto")
 ## Dependencies
 
 - `Http2Frames.jl` - HTTP/2 frame serialization and deserialization
-- `Http2HPACK.jl` - Header compression implementation
+- `Http2Hpack.jl` - Header compression implementation
 - `Base64.jl` - Base64 encoding for HTTP/2 settings
 
 ## Quick Start
