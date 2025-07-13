@@ -11,7 +11,7 @@ module H2Settings
 
 using ..H2Exceptions
 using ..H2Errors
-using H2Frames.FrameTypes
+using Http2Frames.FrameTypes
 using DataStructures
 
 export Settings, ChangedSetting

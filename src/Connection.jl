@@ -10,8 +10,8 @@ using ..H2Errors
 using ..H2Windows
 using ..Config
 using ..H2Settings
-using H2Frames
-using HPACK
+using Http2Frames
+using Http2Hpack
 using Logging
 using Base64
 
@@ -145,8 +145,8 @@ function initiate_connection!(conn::H2Connection)
     end
     
     settings_dict = Dict{UInt16, UInt32}((UInt16(k) => v for (k, v) in conn.local_settings))
-    settings_frame = H2Frames.SettingsFrame(settings_dict)
-    serialized_bytes = H2Frames.serialize_frame(settings_frame)
+    settings_frame = Http2Frames.SettingsFrame(settings_dict)
+    serialized_bytes = Http2Frames.serialize_frame(settings_frame)
     write(conn.outbound_buffer, serialized_bytes)
     
     @debug "Connection initiated. Preface and/or SETTINGS queued."
@@ -201,11 +201,11 @@ function receive_data!(conn::H2Connection, data::Vector{UInt8})::Vector{Events.E
     events = Events.Event[]
     last_successful_position = position(conn.inbound_buffer)
 
-    while bytesavailable(conn.inbound_buffer) >= H2Frames.FRAME_HEADER_SIZE
+    while bytesavailable(conn.inbound_buffer) >= Http2Frames.FRAME_HEADER_SIZE
         mark(conn.inbound_buffer)
-        header_bytes = read(conn.inbound_buffer, H2Frames.FRAME_HEADER_SIZE)
-        header = H2Frames.deserialize_frame_header(header_bytes)
-        frame_length = H2Frames.FRAME_HEADER_SIZE + header.length
+        header_bytes = read(conn.inbound_buffer, Http2Frames.FRAME_HEADER_SIZE)
+        header = Http2Frames.deserialize_frame_header(header_bytes)
+        frame_length = Http2Frames.FRAME_HEADER_SIZE + header.length
         reset(conn.inbound_buffer)
 
         max_size = get(conn.local_settings, SETTINGS_MAX_FRAME_SIZE, 16384)
@@ -218,11 +218,11 @@ function receive_data!(conn::H2Connection, data::Vector{UInt8})::Vector{Events.E
         end
 
         unmark(conn.inbound_buffer)
-        read(conn.inbound_buffer, H2Frames.FRAME_HEADER_SIZE)
+        read(conn.inbound_buffer, Http2Frames.FRAME_HEADER_SIZE)
         payload_bytes = read(conn.inbound_buffer, header.length)
         
         try
-            frame_obj = H2Frames.create_frame(header, payload_bytes)
+            frame_obj = Http2Frames.create_frame(header, payload_bytes)
             new_events = process_frame(conn, frame_obj)
             if !isnothing(new_events) && !isempty(new_events)
                 append!(events, new_events)
@@ -315,17 +315,17 @@ function _handle_h2c_upgrade(conn::H2Connection)::Vector{Events.Event}
         try
             settings_b64 = settings_match.captures[1]
             settings_bytes = Base64.base64decode(settings_b64)
-            if length(settings_bytes) >= H2Frames.FRAME_HEADER_SIZE + 6 
-                header_bytes = settings_bytes[1:H2Frames.FRAME_HEADER_SIZE]
-                header = H2Frames.deserialize_frame_header(header_bytes)
+            if length(settings_bytes) >= Http2Frames.FRAME_HEADER_SIZE + 6 
+                header_bytes = settings_bytes[1:Http2Frames.FRAME_HEADER_SIZE]
+                header = Http2Frames.deserialize_frame_header(header_bytes)
                 
-                if header.frame_type == H2Frames.SETTINGS_FRAME
-                    payload_bytes = settings_bytes[H2Frames.FRAME_HEADER_SIZE+1:end]
-                    settings_frame = H2Frames.deserialize_settings_frame(header, payload_bytes)
+                if header.frame_type == Http2Frames.SETTINGS_FRAME
+                    payload_bytes = settings_bytes[Http2Frames.FRAME_HEADER_SIZE+1:end]
+                    settings_frame = Http2Frames.deserialize_settings_frame(header, payload_bytes)
                     
                     for (key, value) in settings_frame.parameters
                         try
-                            setting_param = H2Frames.SettingsParameter(key)
+                            setting_param = Http2Frames.SettingsParameter(key)
                             conn.remote_settings[setting_param] = value
                             http2_settings[key] = value
                         catch e
@@ -346,7 +346,7 @@ function _handle_h2c_upgrade(conn::H2Connection)::Vector{Events.Event}
                         http2_settings[setting_id] = setting_value
                         
                         try
-                            setting_param = H2Frames.SettingsParameter(setting_id)
+                            setting_param = Http2Frames.SettingsParameter(setting_id)
                             conn.remote_settings[setting_param] = setting_value
                         catch e
                             @debug "Unknown or invalid setting key: $setting_id"
@@ -373,57 +373,57 @@ function _handle_h2c_upgrade(conn::H2Connection)::Vector{Events.Event}
 end
 
 """
-process_frame(conn::H2Connection, frame::H2Frames.HTTP2Frame)
+process_frame(conn::H2Connection, frame::Http2Frames.HTTP2Frame)
 
 Processes an HTTP/2 frame, updating connection/stream state and generating events.
 
 # Arguments
 - `conn::H2Connection`: The connection object
-- `frame::H2Frames.HTTP2Frame`: Frame to process
+- `frame::Http2Frames.HTTP2Frame`: Frame to process
 
 # Returns
 - `Vector{Events.Event}` or `nothing`: Events generated or nothing for invalid frames
 
 # Examples
 ```julia
-frame = H2Frames.create_frame(header, payload)
+frame = Http2Frames.create_frame(header, payload)
 events = process_frame(conn, frame)
 ```
 """
-function process_frame(conn::H2Connection, frame::H2Frames.HTTP2Frame)
-    sid = UInt32(H2Frames.stream_id(frame))
+function process_frame(conn::H2Connection, frame::Http2Frames.HTTP2Frame)
+    sid = UInt32(Http2Frames.stream_id(frame))
     if sid == 0
-        if frame isa H2Frames.FrameSettings.SettingsFrame
-            if H2Frames.is_ack(frame)
+        if frame isa Http2Frames.FrameSettings.SettingsFrame
+            if Http2Frames.is_ack(frame)
                 return Events.Event[]
             end
             changed_settings = Dict{Symbol, UInt32}()
             for (key, value) in frame.parameters
-                param = H2Frames.setting_name(key)
-                const_key = getfield(H2Frames, param)
+                param = Http2Frames.setting_name(key)
+                const_key = getfield(Http2Frames, param)
                 conn.remote_settings[const_key] = value
                 changed_settings[Symbol(param)] = value
             end
             events = Events.Event[]
             push!(events, Events.SettingsChanged(changed_settings))
-            ack_frame = H2Frames.SettingsFrame(Dict{UInt16, UInt32}(); ack=true)
-            serialized_ack = H2Frames.serialize_frame(ack_frame)
+            ack_frame = Http2Frames.SettingsFrame(Dict{UInt16, UInt32}(); ack=true)
+            serialized_ack = Http2Frames.serialize_frame(ack_frame)
             write(conn.outbound_buffer, serialized_ack)
             return events
-        elseif frame isa H2Frames.PingFrame
-            if H2Frames.is_ping_ack(frame)
+        elseif frame isa Http2Frames.PingFrame
+            if Http2Frames.is_ping_ack(frame)
                 return [Events.PingAck(Vector{UInt8}(frame.data))]
             else
-                pong_frame = H2Frames.PingFrame(frame.data; ack=true)
-                write(conn.outbound_buffer, H2Frames.serialize_frame(pong_frame))
+                pong_frame = Http2Frames.PingFrame(frame.data; ack=true)
+                write(conn.outbound_buffer, Http2Frames.serialize_frame(pong_frame))
                 return [Events.PingReceived(Vector{UInt8}(frame.data))]
             end
-        elseif frame isa H2Frames.GoAwayFrame
+        elseif frame isa Http2Frames.GoAwayFrame
             last_stream_id = UInt32(frame.last_stream_id)
             error_code = UInt32(frame.error_code)
             debug_data = Vector{UInt8}(frame.debug_data)
             return [Events.ConnectionTerminated(last_stream_id, error_code, debug_data)]
-        elseif frame isa H2Frames.WindowUpdateFrame
+        elseif frame isa Http2Frames.WindowUpdateFrame
             increment = UInt32(frame.window_size_increment)
             if increment == 0
                 throw(ProtocolError("WINDOW_UPDATE increment on connection cannot be zero"))
@@ -438,7 +438,7 @@ function process_frame(conn::H2Connection, frame::H2Frames.HTTP2Frame)
             throw(ProtocolError("Invalid frame type $(typeof(frame)) on stream 0"))
         end
     end
-    if frame isa H2Frames.PriorityFrame
+    if frame isa Http2Frames.PriorityFrame
         if frame.stream_dependency == sid
             throw(ProtocolError("Stream $sid cannot depend on itself"))
         end
@@ -448,21 +448,21 @@ function process_frame(conn::H2Connection, frame::H2Frames.HTTP2Frame)
         return [Events.PriorityChanged(sid, priority)]
     end
 
-    can_create_stream = frame isa H2Frames.Headers.HeadersFrame || frame isa H2Frames.PushPromiseFrame
+    can_create_stream = frame isa Http2Frames.Headers.HeadersFrame || frame isa Http2Frames.PushPromiseFrame
     stream = _get_stream(conn, sid, can_create=can_create_stream)
     if isnothing(stream)
-        if !(frame isa H2Frames.WindowUpdateFrame || frame isa H2Frames.PriorityFrame || frame isa H2Frames.RstStreamFrame)
-            write(conn.outbound_buffer, H2Frames.serialize_frame(reset_frame))
+        if !(frame isa Http2Frames.WindowUpdateFrame || frame isa Http2Frames.PriorityFrame || frame isa Http2Frames.RstStreamFrame)
+            write(conn.outbound_buffer, Http2Frames.serialize_frame(reset_frame))
         end
         return nothing
     end
 
-    if frame isa H2Frames.RstStreamFrame
+    if frame isa Http2Frames.RstStreamFrame
         stream.state = :closed
         return [Events.StreamReset(sid, UInt32(frame.error_code))]
     end
 
-    if frame isa H2Frames.FrameData.DataFrame
+    if frame isa Http2Frames.FrameData.DataFrame
         data_len = UInt32(length(frame.data))
         window_consumed!(stream.inbound_window_manager, data_len)
         window_consumed!(conn.inbound_window_manager, data_len)
@@ -476,12 +476,12 @@ function process_frame(conn::H2Connection, frame::H2Frames.HTTP2Frame)
             stream.state = :half_closed_remote
         end
         return events
-    elseif frame isa H2Frames.Headers.HeadersFrame
+    elseif frame isa Http2Frames.Headers.HeadersFrame
         stream.state = :open
         events = Events.Event[]
         headers = Vector{Pair{String, String}}()
         try
-            headers = HPACK.decode_headers(conn.hpack_decoder, frame.header_block_fragment)
+            headers = Http2Hpack.decode_headers(conn.hpack_decoder, frame.header_block_fragment)
         catch e
             throw(ProtocolError("HPACK decoding failed: $e"))
         end
@@ -515,26 +515,26 @@ function process_frame(conn::H2Connection, frame::H2Frames.HTTP2Frame)
             stream.state = :half_closed_remote
         end
         return events
-    elseif frame isa H2Frames.WindowUpdateFrame
+    elseif frame isa Http2Frames.WindowUpdateFrame
         increment = UInt32(frame.window_size_increment)
         if increment == 0
-            reset_frame = H2Frames.RstStreamFrame(sid, PROTOCOL_ERROR)
-            write(conn.outbound_buffer, H2Frames.serialize_frame(reset_frame))
+            reset_frame = Http2Frames.RstStreamFrame(sid, PROTOCOL_ERROR)
+            write(conn.outbound_buffer, Http2Frames.serialize_frame(reset_frame))
             return nothing
         end
         new_window = stream.send_window + increment
         if new_window > 2^31 - 1
-            reset_frame = H2Frames.RstStreamFrame(sid, FLOW_CONTROL_ERROR)
-            write(conn.outbound_buffer, H2Frames.serialize_frame(reset_frame))
+            reset_frame = Http2Frames.RstStreamFrame(sid, FLOW_CONTROL_ERROR)
+            write(conn.outbound_buffer, Http2Frames.serialize_frame(reset_frame))
             return nothing
         end
         stream.send_window = new_window
         return [Events.WindowUpdated(sid, increment)]
-    elseif frame isa H2Frames.RstStreamFrame
+    elseif frame isa Http2Frames.RstStreamFrame
         error_code = UInt32(frame.error_code)
         stream.state = :closed
         return [Events.StreamReset(sid, error_code)]
-    elseif frame isa H2Frames.PriorityFrame
+    elseif frame isa Http2Frames.PriorityFrame
         if frame.stream_dependency == sid
             throw(ProtocolError("Stream $sid cannot depend on itself"))
         end
@@ -573,9 +573,9 @@ function prioritize!(conn::H2Connection, stream_id::UInt32;
         throw(H2Exceptions.ProtocolError("A stream cannot depend on itself"))
     end
     
-    priority_frame = H2Frames.PriorityFrame(Int(stream_id), exclusive, Int(depends_on), weight - 1)
+    priority_frame = Http2Frames.PriorityFrame(Int(stream_id), exclusive, Int(depends_on), weight - 1)
     
-    serialized_bytes = H2Frames.serialize_frame(priority_frame)
+    serialized_bytes = Http2Frames.serialize_frame(priority_frame)
     write(conn.outbound_buffer, serialized_bytes)
     
     @debug "Queued PRIORITY frame for stream $stream_id"
@@ -620,12 +620,12 @@ function send_headers(conn::H2Connection, stream_id::UInt32, headers;
         exclusive = !isnothing(priority_exclusive) ? priority_exclusive : false
         if !(1 <= weight <= 256) throw(ArgumentError("Weight must be between 1 and 256")) end
         if depends_on == stream_id throw(H2Exceptions.ProtocolError("A stream cannot depend on itself")) end
-        priority_info = H2Frames.Headers.PriorityInfo(exclusive, UInt32(depends_on), weight)
+        priority_info = Http2Frames.Headers.PriorityInfo(exclusive, UInt32(depends_on), weight)
     end
 
-    frame = H2Frames.create_headers_frame(Int(stream_id), headers, conn.hpack_encoder, 
+    frame = Http2Frames.create_headers_frame(Int(stream_id), headers, conn.hpack_encoder, 
                                          end_stream=end_stream, priority_info=priority_info)
-    serialized_bytes = H2Frames.serialize_frame(frame)
+    serialized_bytes = Http2Frames.serialize_frame(frame)
     write(conn.outbound_buffer, serialized_bytes)
     
     stream = _get_or_create_stream(conn, stream_id)
@@ -671,9 +671,9 @@ function send_data(conn::H2Connection, stream_id::UInt32, data::Vector{UInt8}; e
         throw(FrameTooLargeError("Data size $(length(data)) exceeds max frame size $(max_frame_size)"))
     end
     
-    frames = H2Frames.create_data_frame(Int(stream_id), data; end_stream=end_stream)
+    frames = Http2Frames.create_data_frame(Int(stream_id), data; end_stream=end_stream)
     for frame in frames
-        serialized_bytes = H2Frames.serialize_frame(frame)
+        serialized_bytes = Http2Frames.serialize_frame(frame)
         write(conn.outbound_buffer, serialized_bytes)
     end
     stream.send_window -= UInt32(length(data))
@@ -699,11 +699,11 @@ send_settings(conn, settings)
 """
 function send_settings(conn::H2Connection, settings::Dict{Symbol, UInt32})
     settings_dict = Dict{UInt16, UInt32}(
-        UInt16(H2Frames.setting_from_symbol(k)) => v for (k, v) in settings
+        UInt16(Http2Frames.setting_from_symbol(k)) => v for (k, v) in settings
     )
     
-    frame = H2Frames.SettingsFrame(settings_dict)
-    serialized_bytes = H2Frames.serialize_frame(frame)
+    frame = Http2Frames.SettingsFrame(settings_dict)
+    serialized_bytes = Http2Frames.serialize_frame(frame)
     write(conn.outbound_buffer, serialized_bytes)
     
     merge!(conn.local_settings, settings)
@@ -729,8 +729,8 @@ function send_ping(conn::H2Connection, data::Vector{UInt8} = rand(UInt8, 8))
         throw(ArgumentError("PING data must be exactly 8 bytes"))
     end
     
-    ping_frame = H2Frames.create_ping_frame(data)
-    serialized_bytes = H2Frames.serialize_frame(ping_frame)
+    ping_frame = Http2Frames.create_ping_frame(data)
+    serialized_bytes = Http2Frames.serialize_frame(ping_frame)
     write(conn.outbound_buffer, serialized_bytes)
 end
 
@@ -756,8 +756,8 @@ function send_goaway(conn::H2Connection, last_stream_id::UInt32, error_code::UIn
     Events.validate_stream_id(last_stream_id)
     Events.validate_error_code(error_code)
     
-    goaway_frame = H2Frames.create_goaway_frame(Int(last_stream_id), Int(error_code), debug_data)
-    serialized_bytes = H2Frames.serialize_frame(goaway_frame)
+    goaway_frame = Http2Frames.create_goaway_frame(Int(last_stream_id), Int(error_code), debug_data)
+    serialized_bytes = Http2Frames.serialize_frame(goaway_frame)
     write(conn.outbound_buffer, serialized_bytes)
 end
 
@@ -781,8 +781,8 @@ function send_rst_stream(conn::H2Connection, stream_id::UInt32, error_code::UInt
     Events.validate_stream_id(stream_id)
     Events.validate_error_code(error_code)
     
-    rst_frame = H2Frames.create_rst_stream_frame(Int(stream_id), Int(error_code))
-    serialized_bytes = H2Frames.serialize_frame(rst_frame)
+    rst_frame = Http2Frames.create_rst_stream_frame(Int(stream_id), Int(error_code))
+    serialized_bytes = Http2Frames.serialize_frame(rst_frame)
     write(conn.outbound_buffer, serialized_bytes)
     
     if haskey(conn.streams, stream_id)
@@ -902,15 +902,15 @@ function acknowledge_received_data!(conn::H2Connection, stream_id::UInt32, size:
     
     stream_increment = process_bytes!(stream.inbound_window_manager, size)
     if !isnothing(stream_increment) && stream_increment > 0
-        update_frame = H2Frames.WindowUpdateFrame(Int(stream_id), Int(stream_increment))
-        write(conn.outbound_buffer, H2Frames.serialize_frame(update_frame))
+        update_frame = Http2Frames.WindowUpdateFrame(Int(stream_id), Int(stream_increment))
+        write(conn.outbound_buffer, Http2Frames.serialize_frame(update_frame))
         @debug "Queued WINDOW_UPDATE for stream $stream_id, increment $stream_increment."
     end
 
     conn_increment = process_bytes!(conn.inbound_window_manager, size)
     if !isnothing(conn_increment) && conn_increment > 0
-        update_frame = H2Frames.WindowUpdateFrame(0, Int(conn_increment))
-        write(conn.outbound_buffer, H2Frames.serialize_frame(update_frame))
+        update_frame = Http2Frames.WindowUpdateFrame(0, Int(conn_increment))
+        write(conn.outbound_buffer, Http2Frames.serialize_frame(update_frame))
         @debug "Queued WINDOW_UPDATE for connection, increment $conn_increment."
     end
 end
@@ -1028,15 +1028,15 @@ Validates HTTP/2 setting values.
 
 # Examples
 ```julia
-_validate_setting(conn, H2Frames.SETTINGS_ENABLE_PUSH, UInt32(1))
+_validate_setting(conn, Http2Frames.SETTINGS_ENABLE_PUSH, UInt32(1))
 ```
 """
 function _validate_setting(conn::H2Connection, key::UInt16, value::UInt32)
-    if key == H2Frames.SETTINGS_ENABLE_PUSH && !(value in [0, 1])
+    if key == Http2Frames.SETTINGS_ENABLE_PUSH && !(value in [0, 1])
         throw(InvalidSettingsValueError("ENABLE_PUSH must be 0 or 1", PROTOCOL_ERROR))
-    elseif key == H2Frames.SETTINGS_INITIAL_WINDOW_SIZE && value > 2^31 - 1
+    elseif key == Http2Frames.SETTINGS_INITIAL_WINDOW_SIZE && value > 2^31 - 1
         throw(InvalidSettingsValueError("INITIAL_WINDOW_SIZE exceeds maximum value", FLOW_CONTROL_ERROR))
-    elseif key == H2Frames.SETTINGS_MAX_FRAME_SIZE && !(16384 <= value <= 16777215)
+    elseif key == Http2Frames.SETTINGS_MAX_FRAME_SIZE && !(16384 <= value <= 16777215)
         throw(InvalidSettingsValueError("MAX_FRAME_SIZE must be between 2^14 and 2^24-1", PROTOCOL_ERROR))
     end
 end

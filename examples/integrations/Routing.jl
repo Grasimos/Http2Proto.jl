@@ -4,10 +4,10 @@ using HTTP
 using JSON3
 using Logging
 using Sockets
-using H2Frames
+using Http2Frames
 
-using H2.Connection: H2Connection, send_headers, send_data, data_to_send
-using H2.Events
+using Http2Proto.Connection: H2Connection, send_headers, send_data, data_to_send
+using Http2Proto.Events
 
 
 export Router, route!, handle_request, start_router
