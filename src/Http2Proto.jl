@@ -1,4 +1,4 @@
-module H2
+module Http2Proto
 
 include("Η2Errors.jl") 
 include("Η2Exceptions.jl")

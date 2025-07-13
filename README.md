@@ -1,4 +1,4 @@
-# H2.jl
+# Http2Proto.jl
 
 A comprehensive HTTP/2 protocol implementation for Julia, providing both client and server functionality with full support for HTTP/2 features including multiplexing, flow control, header compression, and connection management.
 
@@ -23,8 +23,8 @@ Pkg.add("H2")
 
 ## Dependencies
 
-- `H2Frames.jl` - HTTP/2 frame serialization and deserialization
-- `HPACK.jl` - Header compression implementation
+- `Http2Frames.jl` - HTTP/2 frame serialization and deserialization
+- `Http2HPACK.jl` - Header compression implementation
 - `Base64.jl` - Base64 encoding for HTTP/2 settings
 
 ## Quick Start
@@ -53,8 +53,8 @@ bash examples/test.bash
 The main connection object that manages HTTP/2 state:
 
 ```julia
-config = H2.H2Config(client_side=true)  # or false for server
-conn = H2.H2Connection(config=config)
+config = Http2Proto.H2Config(client_side=true)  # or false for server
+conn = Http2Proto.H2Connection(config=config)
 ```
 
 ### Configuration Options
@@ -64,20 +64,20 @@ conn = H2.H2Connection(config=config)
 
 ### Event System
 
-H2.jl uses an event-driven architecture. Key events include:
+Http2Proto.jl uses an event-driven architecture. Key events include:
 
-- `H2.Events.RequestReceived` - New request received
-- `H2.Events.ResponseReceived` - Response received
-- `H2.Events.DataReceived` - Data frame received
-- `H2.Events.StreamEnded` - Stream completed
-- `H2.Events.SettingsChanged` - Settings frame processed
-- `H2.Events.PriorityChanged` - Priority frame received
-- `H2.Events.StreamReset` - Stream reset
-- `H2.Events.ConnectionTerminated` - Connection closed
-- `H2.Events.PingReceived` - Ping frame received
-- `H2.Events.PingAck` - Ping acknowledgment received
-- `H2.Events.InformationalResponseReceived` - 1xx response received
-- `H2.Events.H2CUpgradeReceived` - HTTP/1.1 to HTTP/2 upgrade
+- `Http2Proto.Events.RequestReceived` - New request received
+- `Http2Proto.Events.ResponseReceived` - Response received
+- `Http2Proto.Events.DataReceived` - Data frame received
+- `Http2Proto.Events.StreamEnded` - Stream completed
+- `Http2Proto.Events.SettingsChanged` - Settings frame processed
+- `Http2Proto.Events.PriorityChanged` - Priority frame received
+- `Http2Proto.Events.StreamReset` - Stream reset
+- `Http2Proto.Events.ConnectionTerminated` - Connection closed
+- `Http2Proto.Events.PingReceived` - Ping frame received
+- `Http2Proto.Events.PingAck` - Ping acknowledgment received
+- `Http2Proto.Events.InformationalResponseReceived` - 1xx response received
+- `Http2Proto.Events.H2CUpgradeReceived` - HTTP/1.1 to HTTP/2 upgrade
 
 ## Advanced Features
 
@@ -85,10 +85,10 @@ H2.jl uses an event-driven architecture. Key events include:
 
 ```julia
 # Set stream priority
-H2.prioritize!(conn, stream_id; weight=128, depends_on=parent_stream_id, exclusive=false)
+Http2Proto.prioritize!(conn, stream_id; weight=128, depends_on=parent_stream_id, exclusive=false)
 
 # Send headers with priority information
-H2.send_headers(conn, stream_id, headers; 
+Http2Proto.send_headers(conn, stream_id, headers; 
                 priority_weight=128, 
                 priority_depends_on=parent_stream_id, 
                 priority_exclusive=false)
@@ -98,7 +98,7 @@ H2.send_headers(conn, stream_id, headers;
 
 ```julia
 # Acknowledge received data to update flow control windows
-H2.acknowledge_received_data!(conn, stream_id, bytes_consumed)
+Http2Proto.acknowledge_received_data!(conn, stream_id, bytes_consumed)
 ```
 
 ### Informational Responses
@@ -106,14 +106,14 @@ H2.acknowledge_received_data!(conn, stream_id, bytes_consumed)
 ```julia
 # Send 1xx responses (server-side)
 informational_headers = [":status" => "103", "link" => "</style.css>; rel=preload; as=style"]
-H2.send_headers(conn, stream_id, informational_headers, end_stream=false)
+Http2Proto.send_headers(conn, stream_id, informational_headers, end_stream=false)
 
 # Send final response
 final_headers = [":status" => "200", "content-type" => "text/html"]
-H2.send_headers(conn, stream_id, final_headers, end_stream=true)
+Http2Proto.send_headers(conn, stream_id, final_headers, end_stream=true)
 ```
 
-### HTTP/1.1 to HTTP/2 Upgrade (h2c)
+### HTTP/1.1 to HTTP/2 Upgrade (Http2Protoc)
 
 ```julia
 # Server handles HTTP/1.1 upgrade requests automatically
@@ -124,12 +124,12 @@ H2.send_headers(conn, stream_id, final_headers, end_stream=true)
 
 The library provides comprehensive error handling:
 
-- `H2.H2Exceptions.ProtocolError` - Protocol violations
+- `Http2Proto.H2Exceptions.ProtocolError` - Protocol violations
 - `ArgumentError` - Invalid parameters (e.g., invalid priority weights)
 
 ## Flow Control Details
 
-H2.jl implements automatic flow control management:
+Http2Proto.jl implements automatic flow control management:
 
 - **Window Management**: Automatic tracking of connection and stream-level flow control windows
 - **Window Updates**: Automatic generation of WINDOW_UPDATE frames when appropriate
@@ -151,12 +151,12 @@ Run tests with:
 
 ```julia
 using Pkg
-Pkg.test("H2")
+Pkg.test("Http2Proto")
 ```
 
 ## Protocol Compliance
 
-H2.jl aims for full RFC 7540 compliance, including:
+Http2Proto.jl aims for full RFC 7540 compliance, including:
 
 - Connection preface handling
 - Frame format compliance
@@ -188,4 +188,4 @@ This implementation is under active development. While it implements the core HT
 
 ---
 
-*H2.jl - Bringing modern HTTP/2 capabilities to the Julia ecosystem*
+*Http2Proto.jl - Bringing modern HTTP/2 capabilities to the Julia ecosystem*

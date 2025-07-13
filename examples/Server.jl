@@ -3,14 +3,14 @@ module Server
 
 using Sockets
 using Logging
-using H2Frames
+using Http2Frames
 using MbedTLS
 using Dates
 
-using H2
-using H2.Connection: H2Connection, receive_data!, send_headers, send_data, data_to_send, initiate_connection!
-using H2.Config: H2Config
-using H2.Events
+using Http2Proto
+using Http2Proto.Connection: H2Connection, receive_data!, send_headers, send_data, data_to_send, initiate_connection!
+using Http2Proto.Config: H2Config
+using Http2Proto.Events
 
 
 include("integrations/Routing.jl")
@@ -258,7 +258,7 @@ function _handle(conn::H2Connection, event::Events.H2CUpgradeReceived, socket::I
     Routing.handle_upgrade(conn, event, socket)
 end
 
-function _handle(conn::H2.Connection.H2Connection, event::H2.Events.WindowUpdated, socket::MbedTLS.SSLContext, request_bodies::Dict{Int64, Vector{UInt8}}, original_requests::Dict{Int64, H2.Events.RequestReceived})
+function _handle(conn::Http2Proto.Connection.H2Connection, event::Http2Proto.Events.WindowUpdated, socket::MbedTLS.SSLContext, request_bodies::Dict{Int64, Vector{UInt8}}, original_requests::Dict{Int64, Http2Proto.Events.RequestReceived})
     @info "Window Updated!"
 end
 """
