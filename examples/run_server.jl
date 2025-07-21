@@ -1,19 +1,15 @@
-include("Server.jl")  
-using .Server
 using Sockets
+include("Server.jl")          # our turbo file
+using .Server
 
-# Start the server
-host = IPv4("127.0.0.1")  # localhost
-port = 8443  # HTTPS port
+const HOST = ip"127.0.0.1"
+const PORT = 8443
 
-server_task = Server.start_secure_server(host, port)
-
-# Keep the server running
-println("Server started on https://127.0.0.1:8443")
-println("Press Ctrl+C to stop")
+tasks = Server.start_secure_server(HOST, PORT)
+println("🚀 Server ready – press Ctrl+C to stop")
 
 try
-    wait(server_task)
+    wait.(tasks)             
 catch InterruptException
-    println("Server stopped")
+    println("\n👋 Shutting down gracefully …")
 end

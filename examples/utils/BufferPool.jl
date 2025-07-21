@@ -12,12 +12,19 @@ struct Pool
     buffer_size::Int
 end
 
-function Pool(max_size::Int = 100, buffer_size::Int = 16384) # 16KB default
+function Pool(max_size::Int = 200, buffer_size::Int = 32768)  # Double buffers, 32KB
     pool = Pool(Channel{IOBuffer}(max_size), buffer_size)
-    for _ in 1:div(max_size, 2)
+    for _ in 1:max_size
         put!(pool.channel, IOBuffer(sizehint=buffer_size))
     end
     return pool
+end
+
+function grow_pool!(pool::Pool, additional::Int)
+    for _ in 1:additional
+        isfull(pool.channel) && break
+        put!(pool.channel, IOBuffer(sizehint=pool.buffer_size))
+    end
 end
 
 function get_buffer(pool::Pool)
