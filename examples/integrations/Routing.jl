@@ -80,12 +80,11 @@ end
 Main router class that manages all routes and middleware.
 """
 mutable struct Router
-    routes::Vector{Route}
+    routes::Dict{String, Vector{Route}}  # Group by method
     middleware::Vector{Function}
     not_found_handler::Union{RouteHandler, Nothing}
     error_handler::Union{Function, Nothing}
-    
-    Router() = new(Route[], Function[], nothing, nothing)
+    Router() = new(Dict{String, Vector{Route}}(), Function[], nothing, nothing)
 end
 
 """
@@ -96,7 +95,7 @@ Add a route to the router.
 function route!(router::Router, method::String, path::String, handler::RouteHandler)
     path_regex, param_names = compile_path_pattern(path)
     route = Route(uppercase(method), path, handler, path_regex, param_names)
-    push!(router.routes, route)
+    push!(get!(router.routes, uppercase(method), Route[]), route)
     return router
 end
 
@@ -180,22 +179,20 @@ end
 Find a matching route for the given request.
 """
 function match_route(router::Router, request::Request)
-    for route in router.routes
-        if route.method == request.method || route.method == "ANY"
-            match_result = match(route.path_regex, request.path)
-            if match_result !== nothing
-                for param_name in route.param_names
-                    if haskey(match_result, param_name)
-                        request.path_params[param_name] = match_result[param_name]
-                    end
+    routes = get(router.routes, request.method, Route[])
+    for route in routes
+        match_result = match(route.path_regex, request.path)
+        if match_result !== nothing
+            for param_name in route.param_names
+                if haskey(match_result, param_name)
+                    request.path_params[param_name] = match_result[param_name]
                 end
-                return route
             end
+            return route
         end
     end
     return nothing
 end
-
 """
     handle_request(router::Router, conn::H2Connection, event::Events.RequestReceived, socket::IO, body::Vector{UInt8} = UInt8[])
 
@@ -209,6 +206,12 @@ function handle_request(router::Router, conn::H2Connection, event::Events.Reques
     try
         for middleware in router.middleware
             middleware(context)
+        end
+        # If the CORS middleware handled an OPTIONS request, the status will be 200.
+        # We can stop processing and send the response immediately.
+        if context.request.method == "OPTIONS" && context.response.status == 200
+            send_response(context)
+            return # Exit early, skipping route matching
         end
         
         route = match_route(router, request)
